@@ -145,14 +145,21 @@ export function createBrickMesh(tile, meta, style, opts = {}) {
     transparent: true,
     depthTest: false,
     depthWrite: false,
-    side: THREE.DoubleSide,
+    // 只渲染正面：背面片元与正面位于同一投影位置、且积分同一盒，
+    // DoubleSide 会让砖中心区域被积分两遍（2× 不透明度带状）。
+    // 背面裁剪后每盒只贡献一遍积分，靠 renderOrder 远→近合成。
+    side: THREE.FrontSide,
     blending: THREE.CustomBlending,
     blendSrc: THREE.OneFactor,
     blendDst: THREE.OneMinusSrcAlphaFactor,
   });
 
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.copy(wmin);
+  // BoxGeometry(1,1,1) 中心在原点，须把中心放到核心区 AABB 中心，
+  // 几何盒才是 [wmin, wmin+size]，与 shader 的 rayBox 假设一致。
+  // 否则几何盒 = [wmin-0.5*size, wmin+0.5*size]，相邻砖交界处数据错位、
+  // 双盒积分叠加 → 瓦片交界出现断裂/亮度跳变。
+  mesh.position.copy(wmin).addScaledVector(size, 0.5);
   mesh.scale.copy(size);
   mesh.userData = {
     key: `${header.level}/${header.x}/${header.y}/${header.z}`,

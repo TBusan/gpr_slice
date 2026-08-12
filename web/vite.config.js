@@ -17,6 +17,7 @@ const MIME = {
 // 这里用 connect 中间件直接在根级服务该目录，避免复制/符号链接。
 export default defineConfig({
   server: {
+    port: 5177,
     fs: {
       allow: ['..'],
     },

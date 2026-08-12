@@ -34,8 +34,13 @@ const viewportEl = document.getElementById('viewport');
   const gpsMapView = new GpsMapView(document.getElementById('mapPanel'), scene, meta);
   (function frame() {
     requestAnimationFrame(frame);
-    sliceView.update();
-    gpsMapView.update();
+    try {
+      sliceView.update();
+      gpsMapView.update();
+    } catch (err) {
+      // 任一视图渲染抛错不打断 rAF 主循环；控制台可定位
+      console.error('[frame]', err);
+    }
   })();
 
   setStatus(`已加载 ${meta.dataset.name} · ${meta.volume.dimensions.join('×')} vox`);

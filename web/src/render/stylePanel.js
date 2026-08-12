@@ -49,6 +49,9 @@ export function createStylePanel(container, style, meta) {
   const lo = globalMin + range * 0.3;
   const hi = globalMax - range * 0.3;
 
+  // 控件引用挂到 style 上，供 autoFitWindow() 等外部更新后同步显示
+  style._inputs = style._inputs || {};
+
   const makeNumber = (label, key, def) => {
     const row = document.createElement('label');
     const span = document.createElement('span');
@@ -63,6 +66,7 @@ export function createStylePanel(container, style, meta) {
     });
     row.append(span, input);
     container.appendChild(row);
+    style._inputs[key] = input;
     return input;
   };
 
@@ -80,13 +84,8 @@ export function createStylePanel(container, style, meta) {
       val.textContent = fmt(v);
     });
     container.appendChild(row);
+    style._inputs[key] = input;
   };
-
-  mkSlider('增益', 'gain', 0.2, 8, 0.05);
-  mkSlider('Gamma', 'gamma', 0.2, 3, 0.01);
-  mkSlider('阈值下限', 'thresholdMin', globalMin, globalMax, 1, v => v.toFixed(0));
-  mkSlider('阈值上限', 'thresholdMax', globalMin, globalMax, 1, v => v.toFixed(0));
-  mkSlider('不透明度', 'opacity', 0, 1, 0.01);
 
   style.thresholdMin = globalMin;
   style.thresholdMax = globalMax;

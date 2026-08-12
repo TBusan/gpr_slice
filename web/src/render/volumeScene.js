@@ -24,6 +24,9 @@ function buildThresholds(meta, viewportHeight, fovDeg) {
 
 const MAX_IN_FLIGHT = 6;
 
+// 瓦片 key 统一为 "level/x/y/z"
+const kkey = (l, x, y, z) => `${l}/${x}/${y}/${z}`;
+
 export class VolumeScene {
   constructor(container, meta) {
     this.meta = meta;
@@ -59,6 +62,8 @@ export class VolumeScene {
     this.queued = new Set();   // 已在加载队列中的 key（去重）
     this.queue = [];
     this.desired = new Set();  // 本帧想渲染的 key 集合
+    this._autoFitted = false;  // 默认显示窗宽只自动适配一次（初始视角），之后交给用户
+    this.version = 0;          // 瓦片加载/淘汰计数，供派生视图（切片等）判断数据是否变化
 
     this.cache = new TileCache(this.cacheLimit());
     this.cache.onEvict(({ mesh, key }) => {
@@ -69,6 +74,7 @@ export class VolumeScene {
       }
       this.meshes.delete(key);
       this.loaded.delete(key);
+      this.version++; // 派生视图依赖的体素集合变化
     });
 
     this.resize();
@@ -196,14 +202,50 @@ export class VolumeScene {
       this.enqueue(key);
     }
 
-    // 场景增删：非 desired 移出场景，但 mesh 保留在 map/cache（LRU 淘汰才真正释放）。
-    // 这样 LOD 过渡期不会全黑，且重新 desired 时能直接恢复 scene.add。
+    // desired 瓦片刷新 LRU 位置：缓存打满时优先淘汰视野外旧瓦片，
+    // 避免把仍在渲染中的瓦片淘汰掉导致闪烁/空洞（LRU 淘汰回调会 dispose + 移出场景）。
+    for (const key of desired) this.cache.get(key);
+
+    // 场景增删（LOD 过渡不产生空洞）：
+    // - 非 desired 的 mesh：若它有「desired 但尚未加载」的后代，则保留在场景中作为
+    //   过渡期 fallback（细瓦片加载完成前该区域仍有粗瓦片覆盖，不会黑屏）；
+    //   后代全部就绪后本帧移出。fallback 也刷新 LRU，避免被淘汰。
+    // - desired 的 mesh：若其粗祖先 fallback 仍在场景中，则暂不加入，
+    //   避免 coarse+fine 双重重叠渲染；祖先移除后下一帧自动加入。
+    const desiredParsed = [...desired].map((k) => k.split('/').map(Number));
+    const fallbackKeys = new Set();
     for (const [key, mesh] of this.meshes) {
-      if (!desired.has(key) && mesh.parent) this.scene.remove(mesh);
+      if (!mesh.parent || desired.has(key)) continue;
+      const h = mesh.userData.header;
+      let need = false;
+      for (const [dl, dx, dy, dz] of desiredParsed) {
+        if (dl >= h.level) continue;
+        const scale = 1 << (h.level - dl);
+        if (dx >= h.x * scale && dx < (h.x + 1) * scale &&
+            dy === h.y && dz >= h.z * scale && dz < (h.z + 1) * scale) {
+          if (!this.loaded.has(kkey(dl, dx, dy, dz))) { need = true; break; }
+        }
+      }
+      if (need) {
+        fallbackKeys.add(key);
+        this.cache.get(key); // 过渡期 fallback 也保护，防止 LRU 淘汰
+      } else {
+        this.scene.remove(mesh);
+      }
     }
     for (const key of desired) {
       const mesh = this.meshes.get(key);
-      if (mesh && !mesh.parent) this.scene.add(mesh);
+      if (!mesh || mesh.parent) continue;
+      const [dl, dx, dy, dz] = key.split('/').map(Number);
+      let hasAncestor = false;
+      for (const fk of fallbackKeys) {
+        const h = this.meshes.get(fk).userData.header;
+        if (h.level <= dl) continue;
+        const scale = 1 << (h.level - dl);
+        if (dx >= h.x * scale && dx < (h.x + 1) * scale &&
+            dy === h.y && dz >= h.z * scale && dz < (h.z + 1) * scale) { hasAncestor = true; break; }
+      }
+      if (!hasAncestor) this.scene.add(mesh);
     }
 
     this.desired = desired;
@@ -217,7 +259,12 @@ export class VolumeScene {
     });
     renderList.forEach((m, i) => { m.renderOrder = i; });
 
-    if (this.style) this.syncStyle();
+    if (this.style) {
+      this.syncStyle();
+      // 初始视角瓦片就绪后，用已加载数据的 p5/p95 自适应默认显示窗宽。
+      // 不做全量全局窗宽（-32628..30855 会把 99% 体素压成同一颜色）。
+      if (!this._autoFitted && this.loaded.size >= 30) this.autoFitWindow();
+    }
 
     this.drainQueue();
 
@@ -248,6 +295,37 @@ export class VolumeScene {
       u.uThresholdMax.value = s.thresholdMax;
       u.uOpacity.value = s.opacity;
     }
+  }
+
+  // 用已加载瓦片的体素分布自动设定显示窗宽（只调 minValue/maxValue 做对比度，
+  // 不改 threshold，避免把强反射裁掉）。采样上限约 20 万，排序一次。
+  autoFitWindow() {
+    const s = this.style;
+    if (!s) return;
+    const samples = [];
+    const N = 200000;
+    for (const mesh of this.meshes.values()) {
+      const u = mesh.material.uniforms.uVolume.value;
+      const data = u.image.data;
+      const step = Math.max(1, Math.floor(data.length / 30000));
+      for (let i = 0; i < data.length; i += step) samples.push(data[i]);
+      if (samples.length >= N) break;
+    }
+    if (samples.length < 1000) return;
+    samples.sort((a, b) => a - b);
+    const q = (p) => samples[Math.min(samples.length - 1, Math.floor(p * samples.length))];
+    let lo = q(0.05), hi = q(0.95);
+    if (!(hi > lo)) return;
+    if (hi - lo < 200) { // 退化解保护：分布极窄时给一个保底窗宽
+      const m = 200;
+      lo = -m; hi = m;
+    }
+    s.minValue = lo;
+    s.maxValue = hi;
+    if (s._inputs && s._inputs.minValue) s._inputs.minValue.value = String(Math.round(lo));
+    if (s._inputs && s._inputs.maxValue) s._inputs.maxValue.value = String(Math.round(hi));
+    this._autoFitted = true;
+    console.log(`[auto-fit] 显示窗宽 ${lo.toFixed(0)} .. ${hi.toFixed(0)}（采样 ${samples.length}）`);
   }
 
   // ---- 加载队列 ----
@@ -284,7 +362,9 @@ export class VolumeScene {
         const mesh = this.createMesh(key, tile);
         this.meshes.set(key, mesh);
         this.cache.set(key, { mesh, key });
-        if (this.desired.has(key)) this.scene.add(mesh);
+        // 不入场景：统一由 tick() 按 fallback 规则决定加入时机
+        // （避免细瓦片绕过祖先检查、与过渡期 coarse fallback 双重重叠渲染）。
+        this.version++;
       })
       .catch(err => {
         this.inFlight.delete(key);

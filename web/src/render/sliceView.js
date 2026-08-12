@@ -36,6 +36,13 @@ export class SliceView {
     this.gridB = new Float32Array(this.gridX * this.gridZ);
     this.gridC = new Float32Array(this.gridX * this.gridY);
 
+    // 重建门控：瓦片集合（version）或滑块/样式变化才重算网格，避免每帧全量 stamp。
+    // 快速平移/缩放的流式加载会每帧 bump version → 重建用 100ms 节流合并（网格最多滞后 100ms）。
+    this._lastVersion = -1;
+    this._styleKeyCache = null;
+    this._dirty = false;
+    this._lastRebuildAt = 0;
+
     this._buildUI();
   }
 
@@ -56,27 +63,53 @@ export class SliceView {
     this.chanSlider.addEventListener('input', () => {
       this.channel = Number(this.chanSlider.value);
       this.bCap.textContent = `B-Scan 通道 ${this.channel}`;
+      this._dirty = true;
     });
     this.depthSlider.addEventListener('input', () => {
       this.depth = Number(this.depthSlider.value);
       this.cCap.textContent = `C-Scan 深度 ${this.depth}`;
+      this._dirty = true;
     });
   }
 
-  // 每帧：无数据则跳过；有数据则重建网格并渲染两张 canvas
+  // 每帧门控：无数据跳过；瓦片版本/滑块/样式变化才重建或重渲染。
+  // 相机移动不改变切片数据，故不在此触发重建。
   update() {
     if (this.scene.loaded.size === 0) return;
-    this._rebuild();
-    this._renderCanvas(this.bCanvas, this.bCtx, this.gridB, this.gridZ);
-    this._renderCanvas(this.cCanvas, this.cCtx, this.gridC, this.gridY);
+    const styleKey = this._styleKey();
+    const tilesChanged = this._lastVersion !== this.scene.version;
+    const styleChanged = styleKey !== this._styleKeyCache;
+    if (!this._dirty && !tilesChanged && !styleChanged) return;
+
+    const now = performance.now();
+    const doRebuild = this._dirty || (tilesChanged && now - this._lastRebuildAt > 100);
+    if (doRebuild) {
+      this._rebuild();
+      this._lastRebuildAt = now;
+    }
+    if (styleChanged || this._dirty || (tilesChanged && doRebuild)) {
+      this._renderCanvas(this.bCanvas, this.bCtx, this.gridB, this.gridZ);
+      this._renderCanvas(this.cCanvas, this.cCtx, this.gridC, this.gridY);
+    }
+    this._lastVersion = this.scene.version;
+    this._styleKeyCache = styleKey;
+    this._dirty = false;
+  }
+
+  // 样式指纹：任一渲染参数或色带变化都要重绘 canvas（网格可复用）。
+  _styleKey() {
+    const s = this.style;
+    return `${s.minValue}|${s.maxValue}|${s.gain}|${s.gamma}|` +
+      `${s.thresholdMin}|${s.thresholdMax}|${s.opacity}|${s.colorMap ? s.colorMap.uuid : 0}`;
   }
 
   // 把所有已加载瓦片 stamp 进网格：level 降序（粗→细），细级覆盖粗级。
+  // NaN 表示「该格无数据」，渲染时映成黑（空单元不被当成真实值 0）。
   _rebuild() {
     const g = this.ghost;
     const { gridX, gridZ } = this;
-    this.gridB.fill(0);
-    this.gridC.fill(0);
+    this.gridB.fill(NaN);
+    this.gridC.fill(NaN);
 
     const meshes = [...this.scene.meshes.values()]
       .sort((a, b) => b.userData.header.level - a.userData.header.level);
@@ -95,20 +128,30 @@ export class SliceView {
       const minZ = this.aabb.min[2] + hdr.z * this.meta.tileD * sz;
 
       // ---- B-Scan：固定通道这一行 (x, z) ----
+      // 粗级瓦片是下采样后的体素，每个体素的世界尺寸覆盖多个网格单元。
+      // 按体素足迹填充 spanX×spanZ 块（最近邻上采样），避免网格留黑缝（断断续续）。
       const k = this.channel;
       if (k < ch) {
         const syStore = g + k;
+        const spanX = Math.max(1, Math.round(sx / this.xRange * (gridX - 1)));
+        const spanZ = Math.max(1, Math.round(sz / this.zRange * (gridZ - 1)));
+        const out = this.gridB;
         for (let szc = 0; szc < cd; szc++) {
-          const worldZ = minZ + szc * sz;
-          const gz = Math.min(gridZ - 1, Math.max(0,
-            Math.round((worldZ - this.aabb.min[2]) / this.zRange * (gridZ - 1))));
+          const gzBase = Math.round((minZ + szc * sz - this.aabb.min[2]) / this.zRange * (gridZ - 1));
           const rowBase = (g + szc) * sh * sw + syStore * sw + g;
-          const out = this.gridB;
           for (let sxc = 0; sxc < cw; sxc++) {
-            const worldX = minX + sxc * sx;
-            const gx = Math.min(gridX - 1, Math.max(0,
-              Math.round((worldX - this.aabb.min[0]) / this.xRange * (gridX - 1))));
-            out[gz * gridX + gx] = data[rowBase + sxc];
+            const gxBase = Math.round((minX + sxc * sx - this.aabb.min[0]) / this.xRange * (gridX - 1));
+            const v = data[rowBase + sxc];
+            for (let dzg = 0; dzg < spanZ; dzg++) {
+              const gz = gzBase + dzg;
+              if (gz < 0 || gz >= gridZ) continue;
+              const row = gz * gridX;
+              for (let dxg = 0; dxg < spanX; dxg++) {
+                const gx = gxBase + dxg;
+                if (gx < 0 || gx >= gridX) break;
+                out[row + gx] = v;
+              }
+            }
           }
         }
       }
@@ -118,13 +161,18 @@ export class SliceView {
       const szc = Math.round((wantZ - minZ) / sz);
       if (szc >= 0 && szc < cd) {
         const out = this.gridC;
+        const spanX = Math.max(1, Math.round(sx / this.xRange * (gridX - 1)));
         for (let syc = 0; syc < ch; syc++) {
           const rowBase = (g + szc) * sh * sw + (g + syc) * sw + g;
           for (let sxc = 0; sxc < cw; sxc++) {
-            const worldX = minX + sxc * sx;
-            const gx = Math.min(gridX - 1, Math.max(0,
-              Math.round((worldX - this.aabb.min[0]) / this.xRange * (gridX - 1))));
-            out[syc * gridX + gx] = data[rowBase + sxc];
+            const gxBase = Math.round((minX + sxc * sx - this.aabb.min[0]) / this.xRange * (gridX - 1));
+            const v = data[rowBase + sxc];
+            const row = syc * gridX;
+            for (let dxg = 0; dxg < spanX; dxg++) {
+              const gx = gxBase + dxg;
+              if (gx < 0 || gx >= gridX) break;
+              out[row + gx] = v;
+            }
           }
         }
       }
@@ -144,6 +192,8 @@ export class SliceView {
     const style = this.style;
     const cm = style.colorMap;
     const cmData = this._cmapData();
+    // 色带数据不可用时（理论上不会）：跳过绘制，保留上一帧内容，避免画布被清成黑。
+    if (!cmData) return;
     const { gridX } = this;
     const gw = gridX - 1, gh = gridH - 1, cw = w - 1, chh = h - 1;
 
@@ -166,17 +216,27 @@ export class SliceView {
 
   // 色带像素数据：three CanvasTexture.image 是 canvas，不是 ImageData；
   // 首次或色带更换时用 2D 上下文取 RGBA。缓存 Uint8ClampedArray。
+  // 兜底：读不到任何像素时用内置灰阶（黑→白），保证 _renderCanvas 永不因空数据中断。
   _cmapData() {
     const cm = this.style.colorMap;
     if (cm === this._cmTex) return this._cmData;
     this._cmTex = cm;
     const src = cm.image;
+    let data = null;
     if (src && src.getContext) {
-      this._cmData = src.getContext('2d').getImageData(0, 0, src.width, src.height).data;
-    } else {
-      this._cmData = (src && src.data) || null;
+      data = src.getContext('2d').getImageData(0, 0, src.width, src.height).data;
+    } else if (src && src.data) {
+      data = src.data;
     }
-    return this._cmData;
+    if (!data || data.length < 1024) {
+      data = new Uint8ClampedArray(1024);
+      for (let i = 0; i < 256; i++) {
+        data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = i;
+        data[i * 4 + 3] = 255;
+      }
+    }
+    this._cmData = data;
+    return data;
   }
 
   _sizeCanvas(canvas) {
