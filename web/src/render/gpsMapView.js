@@ -27,23 +27,43 @@ export class GpsMapView {
     this.canvas = document.createElement('canvas');
     container.appendChild(this.canvas);
     this.ctx = this.canvas.getContext('2d');
+
+    this._pt = [0, 0];        // W2: pointAtFrac 复用数组，避免每帧 65+ 次分配
+    this._lastXFrac = null;   // W4: 门控（相机 X 与画布尺寸均不变则跳过重绘）
+    this._lastW = -1;
+    this._lastH = -1;
   }
 
-  // 弧长→UTM 点插值（f ∈ [0,1] 为总弧长比例）
+  // 弧长→UTM 点插值（f ∈ [0,1] 为总弧长比例）。返回 this._pt 的复用数组，
+  // 调用方须立即读取（下一次调用会覆盖）。
   pointAtFrac(f) {
     const target = f * this.total;
     let i = 1;
     while (i < this.cum.length && this.cum[i] < target) i++;
-    if (i >= this.cum.length) return this.pts[this.pts.length - 1];
+    if (i >= this.cum.length) {
+      const last = this.pts[this.pts.length - 1];
+      this._pt[0] = last[0];
+      this._pt[1] = last[1];
+      return this._pt;
+    }
     const a = (target - this.cum[i - 1]) / (this.cum[i] - this.cum[i - 1] || 1);
     const p0 = this.pts[i - 1], p1 = this.pts[i];
-    return [p0[0] + (p1[0] - p0[0]) * a, p0[1] + (p1[1] - p0[1]) * a];
+    this._pt[0] = p0[0] + (p1[0] - p0[0]) * a;
+    this._pt[1] = p0[1] + (p1[1] - p0[1]) * a;
+    return this._pt;
   }
 
   update() {
     const cam = this.scene.camera.position;
     const f = (cam.x - this.aabb.min[0]) / this.xRange;
     this.xFrac = Math.max(0, Math.min(1, f));
+    // W4: 相机未动且画布尺寸未变 → 跳过重绘（2D 轨迹与标记只依赖这两者）
+    const cw = this.canvas.clientWidth || 220;
+    const ch = this.canvas.clientHeight || 130;
+    if (this.xFrac === this._lastXFrac && cw === this._lastW && ch === this._lastH) return;
+    this._lastXFrac = this.xFrac;
+    this._lastW = cw;
+    this._lastH = ch;
     this.draw();
   }
 
@@ -94,14 +114,17 @@ export class GpsMapView {
     });
     ctx.stroke();
 
-    // 卷覆盖范围段（弧长 0..1 → 蓝）
-    const seg0 = this.pointAtFrac(0);
-    const seg1 = this.pointAtFrac(1);
+    // 卷覆盖范围段（弧长 0..1 → 蓝）：沿折线按累计弧长密集采样，
+    // 而不是把两端用一条直线连起来（弯路会被画成直线）。
+    const SEG = 64;
     ctx.strokeStyle = '#4d9fff';
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(X(seg0[0]), Y(seg0[1]));
-    ctx.lineTo(X(seg1[0]), Y(seg1[1]));
+    for (let i = 0; i <= SEG; i++) {
+      const p = this.pointAtFrac(i / SEG);
+      if (i === 0) ctx.moveTo(X(p[0]), Y(p[1]));
+      else ctx.lineTo(X(p[0]), Y(p[1]));
+    }
     ctx.stroke();
 
     // 相机标记（圆 + 指向）

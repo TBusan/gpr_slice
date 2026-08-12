@@ -18,7 +18,30 @@ struct TileDesc {
     // 存储坐标 (sw,sh,sd) 对应的世界体素：wx = tx*tileW - ghost + sw（并 clamp 到卷边界）
 };
 
-// 对指定层级卷分块（含 ghost 与统计）。
+// 瓦片网格：把某级卷切成 ntx×nty×ntz 个瓦片（由卷尺寸一次算出）。
+struct TileGrid {
+    int64_t ntx = 0, nty = 0, ntz = 0;
+    int tileW = 0, tileH = 0, tileD = 0;
+    int ghost = 0;
+
+    int64_t Count() const { return ntx * nty * ntz; }
+
+    // 由线性序号反解瓦片坐标（P1 并行分发用）。
+    void Decode(int64_t idx, int& tx, int& ty, int& tz) const {
+        tz = (int)(idx / (ntx * nty));
+        ty = (int)((idx / ntx) % nty);
+        tx = (int)(idx % ntx);
+    }
+};
+
+// 由卷尺寸生成网格。
+TileGrid MakeTileGrid(const Volume& vol, int tileW, int tileH, int tileD, int ghost);
+
+// 构建单个瓦片（只读 vol，线程安全）。out.data 内部分配。
+void BuildTile(const Volume& vol, int level, int tx, int ty, int tz,
+               const TileGrid& grid, TileDesc& out);
+
+// 兼容旧调用：构建全部瓦片（内部循环 BuildTile）。
 void BuildTiles(const Volume& vol, int level, int tileW, int tileH, int tileD,
                 int ghost, std::vector<TileDesc>& out);
 

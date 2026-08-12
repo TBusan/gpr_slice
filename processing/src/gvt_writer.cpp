@@ -17,9 +17,8 @@ int64_t WriteGvtFile(const std::string& outDirUtf8, const TileDesc& tile, int zs
                         std::to_string(tile.tx) / std::to_string(tile.ty) /
                         (std::to_string(tile.tz) + ".gvt");
 
-    std::error_code ec;
-    fs::create_directories(tilePath.parent_path(), ec);
-    if (ec) return -1;
+    // 目录由并行管线在分发前串行预创建，此处不再 create_directories，
+    // 避免多线程并发建目录在 Windows 上的 filesystem_error 竞态。
 
     const size_t srcBytes = (size_t)tile.data.size() * sizeof(int16_t);
     const size_t bound = ZSTD_compressBound(srcBytes);

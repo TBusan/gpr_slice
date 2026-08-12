@@ -1,6 +1,7 @@
 #include "regularizer.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 
 namespace gvt {
@@ -9,9 +10,13 @@ void Regularize(const std::vector<ChannelHeader>& headers,
                 const std::vector<std::vector<int16_t>>& channelData,
                 const std::vector<double>& xOffsetsByChannel,
                 const RegularizeOptions& opts,
-                Volume& outVol, RegularizedMeta& outMeta) {
+                Volume& outVol, RegularizedMeta& outMeta,
+                int16_t& outMin, int16_t& outMax) {
     const int nc = (int)headers.size();
-    if (nc == 0) return;
+    if (nc == 0) {
+        outMin = outMax = 0;
+        return;
+    }
 
     const int samples = headers[0].samples;
     if (samples <= 0) {
@@ -46,6 +51,7 @@ void Regularize(const std::vector<ChannelHeader>& headers,
 
     outVol.Alloc(nx, ny, nz);
 
+    int mn = INT16_MAX, mx = INT16_MIN;
     for (int y = 0; y < nc; ++y) {
         const int ch = order[y];
         const int zeroCh = headers[ch].zeroLevel;
@@ -60,11 +66,15 @@ void Regularize(const std::vector<ChannelHeader>& headers,
                     if (s >= 0 && s < samples) val = src[row + s];
                 }
                 outVol.At(x, y, z) = val;
+                if (val < mn) mn = val;
+                if (val > mx) mx = val;
             }
         }
         std::fprintf(stderr, "  [ch] Y=%d 通道#%d trace=%lld xOff=%+.3f 已就位\n",
                      y, ch, (long long)n, xOffsetsByChannel[ch]);
     }
+    outMin = (mn == INT16_MAX) ? 0 : (int16_t)mn;
+    outMax = (mx == INT16_MIN) ? 0 : (int16_t)mx;
 
     // 元数据
     outMeta.channels = nc;

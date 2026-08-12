@@ -38,7 +38,8 @@ export function makeColorMap(name) {
     const t = i / (size - 1);
     let r = 0, g = 0, b = 0;
     if (name === 'grayscale') {
-      r = g = b = 255;
+      // 黑→白线性渐变（此前写成常量 255，整个色带全白 → 图例/切片一片白）
+      r = g = b = t * 255;
     } else if (name === 'blue-red') {
       r = t * 255;
       b = (1 - t) * 255;

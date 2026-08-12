@@ -65,6 +65,9 @@ export class VolumeScene {
     this._autoFitted = false;  // 默认显示窗宽只自动适配一次（初始视角），之后交给用户
     this.version = 0;          // 瓦片加载/淘汰计数，供派生视图（切片等）判断数据是否变化
 
+    this._thKey = null;        // W1: LOD 阈值缓存键（clientHeight|fov），变化才重算
+    this._scratchV = new THREE.Vector3(); // W2: 复用临时向量，减少每帧 GC
+
     this.cache = new TileCache(this.cacheLimit());
     this.cache.onEvict(({ mesh, key }) => {
       if (mesh && mesh.parent) mesh.parent.remove(mesh);
@@ -148,7 +151,7 @@ export class VolumeScene {
     const desired = new Set();
     const byLevel = this.tilesByLevel;
     const visit = (L, tx, ty, tz, box) => {
-      const d = this.camera.position.distanceTo(box.getCenter(new THREE.Vector3()));
+      const d = this.camera.position.distanceTo(box.getCenter(this._scratchV));
       if (L === 0 || d > this.thresholds.get(L)) {
         desired.add(`${L}/${tx}/${ty}/${tz}`);
         return;
@@ -185,9 +188,13 @@ export class VolumeScene {
       this.lastFpsAt = now;
     }
 
-    this.thresholds = buildThresholds(
-      this.meta, this.renderer.domElement.clientHeight || 800, this.camera.fov
-    );
+    // W1: 阈值只随视口高度/fov 变化（fov 固定，实际仅在 resize 时重算）
+    const vh = this.renderer.domElement.clientHeight || 800;
+    const vf = this.camera.fov;
+    if (this._thKey !== vh + '|' + vf) {
+      this._thKey = vh + '|' + vf;
+      this.thresholds = buildThresholds(this.meta, vh, vf);
+    }
 
     this.frustum = new THREE.Frustum();
     this.frustum.setFromProjectionMatrix(
@@ -205,6 +212,12 @@ export class VolumeScene {
     // desired 瓦片刷新 LRU 位置：缓存打满时优先淘汰视野外旧瓦片，
     // 避免把仍在渲染中的瓦片淘汰掉导致闪烁/空洞（LRU 淘汰回调会 dispose + 移出场景）。
     for (const key of desired) this.cache.get(key);
+
+    // 最粗级（全览）瓦片常驻缓存：B/C-Scan 切片视图直接读 scene.meshes（LRU 缓存里的全部 mesh），
+    // 相机放大到细分级时这些瓦片虽不在 3D 场景中，但如果被 LRU 淘汰，切片就会在视野外出现黑洞
+    // （用户反馈的"数据断断续续"）。每帧 touch 使其永不成为淘汰目标（92 块 × 0.56MB ≈ 51MB，可接受）。
+    const maxLevelList = this.tilesByLevel.get(this.meta.maxLevel).list;
+    for (const t of maxLevelList) this.cache.get(kkey(t.level, t.x, t.y, t.z));
 
     // 场景增删（LOD 过渡不产生空洞）：
     // - 非 desired 的 mesh：若它有「desired 但尚未加载」的后代，则保留在场景中作为
@@ -285,6 +298,7 @@ export class VolumeScene {
   syncStyle() {
     const s = this.style;
     for (const mesh of this.meshes.values()) {
+      if (!mesh.parent) continue; // 只同步场景内可见 mesh；隐藏 mesh 入场景当帧补齐
       const u = mesh.material.uniforms;
       u.uColorMap.value = s.colorMap;
       u.uMinValue.value = s.minValue;
@@ -334,7 +348,7 @@ export class VolumeScene {
     this.queued.add(key);
     const [level, x, y, z] = key.split('/').map(Number);
     const t = this.tilesByLevel.get(level)?.idx.get(`${x}/${y}/${z}`);
-    const dist = t ? this.camera.position.distanceTo(t.box.getCenter(new THREE.Vector3())) : 0;
+    const dist = t ? this.camera.position.distanceTo(t.box.getCenter(this._scratchV)) : 0;
     this.queue.push({ key, level, dist });
   }
 

@@ -26,8 +26,9 @@ Volume DownsampleMaxAbs(const Volume& src, int sx, int sy, int sz) {
                 int maxAbs = -1;
                 for (int64_t zz = z0; zz < z1; ++zz) {
                     for (int64_t yy = y0; yy < y1; ++yy) {
+                        const int16_t* row = &src.v[(size_t)(src.nx * (yy + src.ny * zz))];
                         for (int64_t xx = x0; xx < x1; ++xx) {
-                            const int16_t val = src.At(xx, yy, zz);
+                            const int16_t val = row[xx];
                             const int a = val < 0 ? -val : val;
                             if (a > maxAbs) {
                                 maxAbs = a;

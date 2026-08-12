@@ -29,10 +29,12 @@ struct RegularizedMeta {
 // 多通道原始数据 -> 规则卷。
 // channelData[i] 为 trace-major int16，长度为 header[i].samples 的整数倍。
 // xOffsetsByChannel[i] 为第 i 通道的跨轨偏移（用于按 x 排序确定 Y 轴）。
+// outMin/outMax 在放置循环内顺带统计（避免后续再整卷扫描一次）。
 void Regularize(const std::vector<ChannelHeader>& headers,
                 const std::vector<std::vector<int16_t>>& channelData,
                 const std::vector<double>& xOffsetsByChannel,
                 const RegularizeOptions& opts,
-                Volume& outVol, RegularizedMeta& outMeta);
+                Volume& outVol, RegularizedMeta& outMeta,
+                int16_t& outMin, int16_t& outMax);
 
 } // namespace gvt

@@ -5,6 +5,7 @@ import { VolumeScene } from './render/volumeScene.js';
 import { createStylePanel } from './render/stylePanel.js';
 import { SliceView } from './render/sliceView.js';
 import { GpsMapView } from './render/gpsMapView.js';
+import { ViewCube } from './render/viewCube.js';
 
 const statusEl = document.getElementById('status');
 const hudEl = document.getElementById('hud');
@@ -29,14 +30,16 @@ const viewportEl = document.getElementById('viewport');
 
   createStylePanel(document.getElementById('stylePanel'), style, meta);
 
-  // 切片 + GPS 视图（每帧与场景同步）
+  // 切片 + GPS + 方向指示器视图（每帧与场景同步）
   const sliceView = new SliceView(scene, style, meta);
   const gpsMapView = new GpsMapView(document.getElementById('mapPanel'), scene, meta);
+  const viewCube = new ViewCube(document.getElementById('viewCube'), scene);
   (function frame() {
     requestAnimationFrame(frame);
     try {
       sliceView.update();
       gpsMapView.update();
+      viewCube.update();
     } catch (err) {
       // 任一视图渲染抛错不打断 rAF 主循环；控制台可定位
       console.error('[frame]', err);
@@ -47,6 +50,7 @@ const viewportEl = document.getElementById('viewport');
   window.__scene = scene; // 调试钩子：控制台直接操作场景
   window.__slice = sliceView;
   window.__gps = gpsMapView;
+  window.__viewCube = viewCube;
   scene.start();
 })();
 
