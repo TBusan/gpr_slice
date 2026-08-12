@@ -179,12 +179,16 @@ export class ViewCube {
   // 切换到工程视图（前/俯/左）：框住整个数据体
   snap(key) {
     const cfg = VIEWS[key];
-    const { camera, controls, meta } = this.scene;
-    const aabb = meta.volumeAABB();
+    const { camera, controls } = this.scene;
+    // 多线宿主：worldBounds() 返回 THREE.Box3；单线 VolumeScene：meta.volumeAABB() 返回数组
+    const isHost = !!this.scene.worldBounds;
+    const aabb = isHost ? this.scene.worldBounds() : this.scene.meta.volumeAABB();
+    const min = isHost ? aabb.min : new THREE.Vector3(...aabb.min);
+    const max = isHost ? aabb.max : new THREE.Vector3(...aabb.max);
     const dims = [
-      aabb.max[0] - aabb.min[0],
-      aabb.max[1] - aabb.min[1],
-      aabb.max[2] - aabb.min[2],
+      max.x - min.x,
+      max.y - min.y,
+      max.z - min.z,
     ];
     // 面内两轴的更大跨度 → 取景距离
     const fit = Math.max(dims[cfg.plane[0]], dims[cfg.plane[1]]);
@@ -192,13 +196,13 @@ export class ViewCube {
     const frameDist = (fit / 2) / Math.tan(halfFov) * 1.25;
     // 相机放在观察轴方向体外：半纵深 + 取景距离
     const d = dims[cfg.axisIdx] / 2 + frameDist;
-    const c = meta.volumeCenter();
+    const c = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
     camera.position.set(
-      c[0] + cfg.axis[0] * d,
-      c[1] + cfg.axis[1] * d,
-      c[2] + cfg.axis[2] * d
+      c.x + cfg.axis[0] * d,
+      c.y + cfg.axis[1] * d,
+      c.z + cfg.axis[2] * d
     );
-    controls.target.set(c[0], c[1], c[2]);
+    controls.target.set(c.x, c.y, c.z);
     camera.up.set(cfg.up[0], cfg.up[1], cfg.up[2]);
     controls.update();
   }

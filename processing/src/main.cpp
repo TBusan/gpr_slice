@@ -69,6 +69,7 @@ struct CliArgs {
     int zstdLevel = 12;
     int jobs = 0;              // 0 = 自动（min(hardware_concurrency,8)）
     std::string gps;           // 空 = 由 --line 基名派生 .utmgps
+    int sliceLod = 2;          // 切片专用 mean-LOD 的降采样次数（相对 LOD0）；0 = 不生成
 };
 
 static bool ParseVec3(const std::string& s, int& a, int& b, int& c) {
@@ -97,7 +98,8 @@ static void PrintHelp() {
         "  gpr2gvt --line <测线基名> [--out <目录>]\n"
         "         [--zero-mode max|channel] [--tile-size W,H,D] [--ghost N]\n"
         "         [--lod-scale X,Y,Z] [--levels N] [--zstd-level N] [--jobs N]\n"
-        "         [--gps <.utmgps 路径>]\n\n"
+        "         [--gps <.utmgps 路径>] [--slice-lod N]\n\n"
+        "  --slice-lod N  生成切片专用 mean-LOD（从 LOD0 箱平均 N 次，级别号=levels；0=不生成）\n\n"
         "示例:\n"
         "  gpr2gvt --line \"data/mingxingroad/明星路_001\" --out dataset\n"
         "  gpr2gvt --line \"data/mingxingroad/明星路_001\" --gps \"data/mingxingroad/明星路_测试路段_rad.utmgps\"\n");
@@ -156,6 +158,9 @@ static bool ParseArgs(const std::vector<std::string>& args, CliArgs& a) {
         } else if (key == "--gps") {
             if (!needsVal()) return false;
             a.gps = val;
+        } else if (key == "--slice-lod") {
+            if (!needsVal()) return false;
+            a.sliceLod = std::atoi(val.c_str());
         } else if (key == "--help" || key == "-h") {
             PrintHelp();
             return false;
@@ -317,7 +322,15 @@ int main() {
 
     // 5. GPS 轨迹
     Metadata md;
-    md.datasetId = "mingxingroad_001";
+    // datasetId 由 --line 基名派生：取 "_NNN" 数字后缀，前缀固定道路拼音。
+    // 例如 明星路_002 → mingxingroad_002（与 dataset/lines/manifest.json 的 id 一致）。
+    {
+        const std::string base = fs::u8path(a.line).filename().u8string();
+        std::string lineNum;
+        if (auto pos = base.rfind('_'); pos != std::string::npos && pos + 1 < base.size())
+            lineNum = base.substr(pos + 1);
+        md.datasetId = "mingxingroad_" + (lineNum.empty() ? "line" : lineNum);
+    }
     md.datasetName = fs::u8path(a.line).filename().u8string();
     md.lod0 = &vol0;
     md.spatial = meta;
@@ -343,14 +356,11 @@ int main() {
     }
 
     // 6. LOD 分层分块写出（并行：构建瓦片 + 压缩 + 写盘）
-    int64_t totalBytes = 0;
-    int64_t totalTiles = 0;
-    Volume current = std::move(vol0);
-    int sxAcc = 1, syAcc = 1, szAcc = 1;
-
-    for (int level = 0; level < a.levels; ++level) {
-        const TileGrid grid = MakeTileGrid(current, a.tileW, a.tileH, a.tileD, a.ghost);
-        const int64_t nTiles = grid.Count();
+    // 通用「写一个 level 的全部瓦片」：并行 BuildTile → WriteGvtFile。
+    // 返回压缩字节数；失败返回 -1（outTiles 回传瓦片数）。
+    auto writeLevel = [&](const Volume& vol, int level, int64_t& outTiles) -> int64_t {
+        const TileGrid grid = MakeTileGrid(vol, a.tileW, a.tileH, a.tileD, a.ghost);
+        outTiles = grid.Count();
 
         // 串行预创建全部瓦片父目录（消除写盘阶段目录并发竞态）
         {
@@ -365,16 +375,16 @@ int main() {
                     }
             if (ec) {
                 std::fprintf(stderr, "[error] 创建瓦片目录失败 L%d\n", level);
-                return 1;
+                return -1;
             }
         }
 
         std::atomic<int64_t> levelBytes{0};
-        int failures = RunParallel(nTiles, nworkers, [&](int64_t i) -> bool {
+        int failures = RunParallel(outTiles, nworkers, [&](int64_t i) -> bool {
             int tx, ty, tz;
             grid.Decode(i, tx, ty, tz);
             TileDesc tile;
-            BuildTile(current, level, tx, ty, tz, grid, tile);
+            BuildTile(vol, level, tx, ty, tz, grid, tile);
             const int64_t n = WriteGvtFile(a.out, tile, a.zstdLevel);
             if (n < 0) return false;
             levelBytes += n;
@@ -382,15 +392,40 @@ int main() {
         });
         if (failures > 0) {
             std::fprintf(stderr, "[error] 写瓦片失败 L%d（%d 块）\n", level, failures);
-            return 1;
+            return -1;
         }
+        return levelBytes.load();
+    };
+
+    int64_t totalBytes = 0;
+    int64_t totalTiles = 0;
+
+    // 切片专用 mean-LOD：从 LOD0 直接箱平均（不继承 max-abs 噪声）。
+    // 必须在 vol0 被 move 进 current 之前算出；随后写成独立级别供 B-Scan/C-Scan 读取。
+    Volume sliceVol;
+    int sliceLevelIdx = -1;
+    if (a.sliceLod > 0) {
+        sliceLevelIdx = a.levels;   // 紧接 max-abs 链之后（如 levels=4 → 级别 4）
+        int ssx = 1, ssy = 1, ssz = 1;
+        for (int i = 0; i < a.sliceLod; ++i) { ssx *= a.sx; ssy *= a.sy; ssz *= a.sz; }
+        std::printf("切片 mean-LOD: 从 LOD0 箱平均 %d×%d×%d → 级别 %d\n", ssx, ssy, ssz, sliceLevelIdx);
+        sliceVol = DownsampleMean(vol0, ssx, ssy, ssz);
+    }
+
+    Volume current = std::move(vol0);
+    int sxAcc = 1, syAcc = 1, szAcc = 1;
+
+    for (int level = 0; level < a.levels; ++level) {
+        int64_t nTiles = 0;
+        const int64_t levelBytes = writeLevel(current, level, nTiles);
+        if (levelBytes < 0) return 1;
 
         totalTiles += nTiles;
-        totalBytes += levelBytes.load();
+        totalBytes += levelBytes;
         std::printf("LOD%d: 尺寸=%lld,%lld,%lld  瓦片=%lld  压缩后=%.1f MB\n",
                     level, (long long)current.nx, (long long)current.ny,
                     (long long)current.nz, (long long)nTiles,
-                    (double)levelBytes.load() / 1048576.0);
+                    (double)levelBytes / 1048576.0);
 
         LevelInfo li;
         li.level = level;
@@ -399,6 +434,7 @@ int main() {
         li.spx = meta.xSpacingM * sxAcc;
         li.spy = meta.ySpacingM * syAcc;
         li.spz = meta.depthPerSampleM * szAcc;
+        li.kernel = "maxabs";
         md.levels.push_back(li);
 
         if (level < a.levels - 1) {
@@ -408,6 +444,31 @@ int main() {
             syAcc *= a.sy;
             szAcc *= a.sz;
         }
+    }
+
+    // 写切片 mean-LOD 瓦片（级别号 = sliceLevelIdx）
+    if (a.sliceLod > 0) {
+        int64_t nTiles = 0;
+        const int64_t bytes = writeLevel(sliceVol, sliceLevelIdx, nTiles);
+        if (bytes < 0) return 1;
+        totalTiles += nTiles;
+        totalBytes += bytes;
+
+        LevelInfo li;
+        li.level = sliceLevelIdx;
+        int ssx = 1, ssy = 1, ssz = 1;
+        for (int i = 0; i < a.sliceLod; ++i) { ssx *= a.sx; ssy *= a.sy; ssz *= a.sz; }
+        li.sx = ssx; li.sy = ssy; li.sz = ssz;
+        li.nx = sliceVol.nx; li.ny = sliceVol.ny; li.nz = sliceVol.nz;
+        li.spx = meta.xSpacingM * ssx;
+        li.spy = meta.ySpacingM * ssy;
+        li.spz = meta.depthPerSampleM * ssz;
+        li.kernel = "mean";
+        md.sliceLevel = li;
+        md.hasSliceLevel = true;
+        std::printf("sliceLevel LOD%d(mean): 尺寸=%lld,%lld,%lld  瓦片=%lld  压缩后=%.1f MB\n",
+                    sliceLevelIdx, (long long)sliceVol.nx, (long long)sliceVol.ny,
+                    (long long)sliceVol.nz, (long long)nTiles, (double)bytes / 1048576.0);
     }
 
     // 7. metadata.json

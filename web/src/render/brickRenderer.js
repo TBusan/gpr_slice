@@ -5,8 +5,19 @@
 //    ghost 边界只用于三线性插值采样（防接缝双重累积，规格书 §20）。
 // 2. shader 输出预乘颜色 + 累积 alpha，混合用 One/OneMinusSrcAlpha
 //    （front-to-back 背向排序合成，见 volumeScene 排序）。
+// 3. 纹理用 HalfFloatType（R16F）：VRAM/保留内存减半。int16 源值 ≤2048 精确保留，
+//    大值离群点（±3 万）半精度舍入误差 ≤16，相对显示窗宽（~6.3 万）不可见。
 
 import * as THREE from 'three';
+
+// float32 → float16（Uint16Array）。int16 值大部分落在半精度精确保留范围，
+// 仅大离群点有 ≤2^4 级舍入，映射到颜色后不可见。
+function toHalfFloatArray(f32) {
+  const n = f32.length;
+  const out = new Uint16Array(n);
+  for (let i = 0; i < n; i++) out[i] = THREE.DataUtils.toHalfFloat(f32[i]);
+  return out;
+}
 
 const VERT = /* glsl */ `
 varying vec3 vWorldPos;
@@ -101,9 +112,11 @@ export function createBrickMesh(tile, meta, style, opts = {}) {
   const coreSize = [header.width - 2 * g, header.height - 2 * g, header.depth - 2 * g];
   const storeSize = [header.width, header.height, header.depth];
 
-  const texture = new THREE.Data3DTexture(f32, storeSize[0], storeSize[1], storeSize[2]);
+  // 半精度上传：切片已解耦（读 CPU Float32），GPU 侧只有 3D 用，转换不影响切片质量。
+  const half = toHalfFloatArray(f32);
+  const texture = new THREE.Data3DTexture(half, storeSize[0], storeSize[1], storeSize[2]);
   texture.format = THREE.RedFormat;
-  texture.type = THREE.FloatType;
+  texture.type = THREE.HalfFloatType;
   const filter = opts.linear ? THREE.LinearFilter : THREE.NearestFilter;
   texture.minFilter = filter;
   texture.magFilter = filter;

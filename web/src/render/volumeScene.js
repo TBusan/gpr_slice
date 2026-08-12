@@ -28,30 +28,61 @@ const MAX_IN_FLIGHT = 6;
 const kkey = (l, x, y, z) => `${l}/${x}/${y}/${z}`;
 
 export class VolumeScene {
-  constructor(container, meta) {
+  constructor(container, meta, opts = {}) {
+    // opts: { shared, basePath, worldOffset, direction, lineId, lineIdx, visible }
+    //   shared = { renderer, scene, camera, controls, cache }：多测线时复用同一渲染器/相机/缓存。
+    //   basePath / worldOffset / direction / lineId / lineIdx：多测线摆放与瓦片 URL 前缀。
+    //   self 模式（无 shared）：保持原有单线行为（自建渲染器 + 自己的 rAF 循环）。
     this.meta = meta;
     this.container = container;
+    this.basePath = opts.basePath || '/dataset';
+    this.worldOffset = opts.worldOffset || [0, 0, 0];
+    this.direction = opts.direction ?? 1;
+    this.lineId = opts.lineId || null;  // 共享缓存 key 前缀（如 "mingxingroad_001/"）
+    this.lineIdx = opts.lineIdx ?? 0;   // 跨线全局 renderOrder 稳定排序 tie-breaker
+    this.visible = opts.visible !== false;
+    this.shared = opts.shared || null;
+    this.ownsRender = !this.shared;     // self 模式才自建渲染器 + 自己的渲染循环
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setClearColor(0x0b0d12, 1);
-    container.appendChild(renderer.domElement);
-    this.renderer = renderer;
+    if (this.shared) {
+      this.renderer = this.shared.renderer;
+      this.scene = this.shared.scene;
+      this.camera = this.shared.camera;
+      this.controls = this.shared.controls;
+      this.cache = this.shared.cache;
+    } else {
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setClearColor(0x0b0d12, 1);
+      container.appendChild(renderer.domElement);
+      this.renderer = renderer;
 
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.05, 80000);
-    this.controls = new OrbitControls(this.camera, renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
-    this.controls.maxDistance = 40000;
-    this.controls.minDistance = 0.5;
+      this.scene = new THREE.Scene();
+      this.camera = new THREE.PerspectiveCamera(45, 1, 0.05, 80000);
+      this.controls = new OrbitControls(this.camera, renderer.domElement);
+      this.controls.enableDamping = true;
+      this.controls.dampingFactor = 0.08;
+      this.controls.maxDistance = 40000;
+      this.controls.minDistance = 0.5;
+
+      this.cache = new TileCache(this.cacheLimit());
+    }
 
     this.style = null; // main.js 注入
 
-    // 浮点纹理线性过滤（ghost 三线性插值的前提）；不支持则退回最近邻
-    this.linearOK = !!renderer.extensions.get('OES_texture_float_linear');
+    // 纹理线性过滤（ghost 三线性插值的前提）。
+    // HalfFloat（R16F）线性过滤是 WebGL2 核心能力；仅 WebGL1 回退才需要扩展。
+    this.linearOK = this.renderer.capabilities.isWebGL2 ||
+      !!this.renderer.extensions.get('OES_texture_half_float_linear');
 
     this.sharedGeo = new THREE.BoxGeometry(1, 1, 1);
+
+    // 多测线：每线一个 group（worldOffset 平移 + 反向线 scale.x = -1 镜像）。
+    // self 模式 group 恒等变换（0,0,0 / +1），行为不变。
+    this.group = new THREE.Group();
+    this.group.position.set(this.worldOffset[0], this.worldOffset[1], this.worldOffset[2]);
+    this.group.scale.x = this.direction;
+    if (this.ownsRender) this.scene.add(this.group);
 
     this.tilesByLevel = this.buildTileIndex(meta);
 
@@ -68,20 +99,24 @@ export class VolumeScene {
     this._thKey = null;        // W1: LOD 阈值缓存键（clientHeight|fov），变化才重算
     this._scratchV = new THREE.Vector3(); // W2: 复用临时向量，减少每帧 GC
 
-    this.cache = new TileCache(this.cacheLimit());
     this.cache.onEvict(({ mesh, key }) => {
+      // 共享缓存：key 带 lineId 前缀，只处理本线的淘汰（避免跨线误删）。
+      if (this.lineId && !key.startsWith(this.lineId + '/')) return;
+      const plain = this.lineId ? key.slice(this.lineId.length + 1) : key;
       if (mesh && mesh.parent) mesh.parent.remove(mesh);
       if (mesh) {
         mesh.material.uniforms.uVolume.value.dispose();
         mesh.material.dispose();
       }
-      this.meshes.delete(key);
-      this.loaded.delete(key);
+      this.meshes.delete(plain);
+      this.loaded.delete(plain);
       this.version++; // 派生视图依赖的体素集合变化
     });
 
-    this.resize();
-    window.addEventListener('resize', () => this.resize());
+    if (this.ownsRender) {
+      this.resize();
+      window.addEventListener('resize', () => this.resize());
+    }
 
     this.frames = 0;
     this.lastFpsAt = 0;
@@ -92,6 +127,21 @@ export class VolumeScene {
   cacheLimit() {
     // 满 tile 纹理 ≈ 258*16*34*4 ≈ 0.56MB；512 个 ≈ 287MB GPU
     return 512;
+  }
+
+  // 共享缓存 key 命名空间：多线共用缓存时前缀 lineId 防 key 冲突；self 模式原样。
+  _ck(key) {
+    return this.lineId ? `${this.lineId}/${key}` : key;
+  }
+
+  // 逐线可见性（多测线）：隐藏 = 组移出场景，宿主跳过其 tick（不加载、不占预算）。
+  setVisible(v) {
+    if (v === this.visible) return;
+    this.visible = v;
+    if (!this.ownsRender) {
+      if (v) this.scene.add(this.group);
+      else this.scene.remove(this.group);
+    }
   }
 
   buildTileIndex(meta) {
@@ -146,12 +196,23 @@ export class VolumeScene {
     this.controls.update();
   }
 
+  // 局部点 → 世界点（多测线 worldOffset 平移 + 反向线 direction 镜像）。
+  // 复用传入向量，避免分配。p 为局部 Box 中心/坐标。
+  _toWorld(p) {
+    p.x = this.worldOffset[0] + p.x * this.direction;
+    p.y = this.worldOffset[1] + p.y;
+    p.z = this.worldOffset[2] + p.z;
+    return p;
+  }
+
   // ---- LOD 递归：本帧应渲染的瓦片 key 集合（每个区域恰好一个）----
   computeDesired() {
     const desired = new Set();
     const byLevel = this.tilesByLevel;
     const visit = (L, tx, ty, tz, box) => {
-      const d = this.camera.position.distanceTo(box.getCenter(this._scratchV));
+      // 相机在世界坐标，瓦片 box 是局部坐标 → 距离按世界点算（跨线偏移/反向镜像）
+      const c = this._toWorld(box.getCenter(this._scratchV));
+      const d = this.camera.position.distanceTo(c);
       if (L === 0 || d > this.thresholds.get(L)) {
         desired.add(`${L}/${tx}/${ty}/${tz}`);
         return;
@@ -196,10 +257,14 @@ export class VolumeScene {
       this.thresholds = buildThresholds(this.meta, vh, vf);
     }
 
-    this.frustum = new THREE.Frustum();
-    this.frustum.setFromProjectionMatrix(
-      new THREE.Matrix4().multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
-    );
+    // 视锥剔除只对 self 模式有意义：多测线共享模式下瓦片 box 是局部坐标，
+    // 与共享相机的世界视锥比较会整体误剔除跨轨偏移大的线 → 共享模式关剔除。
+    this.frustum = this.ownsRender ? new THREE.Frustum() : null;
+    if (this.frustum) {
+      this.frustum.setFromProjectionMatrix(
+        new THREE.Matrix4().multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
+      );
+    }
 
     const desired = this.computeDesired();
 
@@ -211,13 +276,7 @@ export class VolumeScene {
 
     // desired 瓦片刷新 LRU 位置：缓存打满时优先淘汰视野外旧瓦片，
     // 避免把仍在渲染中的瓦片淘汰掉导致闪烁/空洞（LRU 淘汰回调会 dispose + 移出场景）。
-    for (const key of desired) this.cache.get(key);
-
-    // 最粗级（全览）瓦片常驻缓存：B/C-Scan 切片视图直接读 scene.meshes（LRU 缓存里的全部 mesh），
-    // 相机放大到细分级时这些瓦片虽不在 3D 场景中，但如果被 LRU 淘汰，切片就会在视野外出现黑洞
-    // （用户反馈的"数据断断续续"）。每帧 touch 使其永不成为淘汰目标（92 块 × 0.56MB ≈ 51MB，可接受）。
-    const maxLevelList = this.tilesByLevel.get(this.meta.maxLevel).list;
-    for (const t of maxLevelList) this.cache.get(kkey(t.level, t.x, t.y, t.z));
+    for (const key of desired) this.cache.get(this._ck(key));
 
     // 场景增删（LOD 过渡不产生空洞）：
     // - 非 desired 的 mesh：若它有「desired 但尚未加载」的后代，则保留在场景中作为
@@ -241,9 +300,9 @@ export class VolumeScene {
       }
       if (need) {
         fallbackKeys.add(key);
-        this.cache.get(key); // 过渡期 fallback 也保护，防止 LRU 淘汰
+        this.cache.get(this._ck(key)); // 过渡期 fallback 也保护，防止 LRU 淘汰
       } else {
-        this.scene.remove(mesh);
+        this.group.remove(mesh);
       }
     }
     for (const key of desired) {
@@ -258,30 +317,31 @@ export class VolumeScene {
         if (dx >= h.x * scale && dx < (h.x + 1) * scale &&
             dy === h.y && dz >= h.z * scale && dz < (h.z + 1) * scale) { hasAncestor = true; break; }
       }
-      if (!hasAncestor) this.scene.add(mesh);
+      if (!hasAncestor) this.group.add(mesh);
     }
 
     this.desired = desired;
 
-    // 背向排序（远→近），renderOrder 递增（只排本帧真正在场景里的 mesh）
+    // 背向排序（远→近）仅 self 模式：多测线由宿主跨线全局排序（renderOrder 需跨线一致）。
     const renderList = [...this.meshes.values()].filter(m => m.parent);
-    renderList.sort((a, b) => {
-      const da = a.userData.center.distanceToSquared(this.camera.position);
-      const db = b.userData.center.distanceToSquared(this.camera.position);
-      return db - da;
-    });
-    renderList.forEach((m, i) => { m.renderOrder = i; });
+    if (this.ownsRender) {
+      renderList.sort((a, b) => {
+        const da = a.userData.center.distanceToSquared(this.camera.position);
+        const db = b.userData.center.distanceToSquared(this.camera.position);
+        return db - da;
+      });
+      renderList.forEach((m, i) => { m.renderOrder = i; });
+    }
 
     if (this.style) {
       this.syncStyle();
-      // 初始视角瓦片就绪后，用已加载数据的 p5/p95 自适应默认显示窗宽。
-      // 不做全量全局窗宽（-32628..30855 会把 99% 体素压成同一颜色）。
-      if (!this._autoFitted && this.loaded.size >= 30) this.autoFitWindow();
+      // 初始视角窗宽自适应只由 self 模式（单线）触发；多测线由宿主统一做一次。
+      if (this.ownsRender && !this._autoFitted && this.loaded.size >= 30) this.autoFitWindow();
     }
 
     this.drainQueue();
 
-    if (this.onStatus) {
+    if (this.ownsRender && this.onStatus) {
       this.onStatus({
         desired: desired.size,
         loaded: this.loaded.size,
@@ -321,8 +381,13 @@ export class VolumeScene {
     for (const mesh of this.meshes.values()) {
       const u = mesh.material.uniforms.uVolume.value;
       const data = u.image.data;
+      // HalfFloat 纹理的 image.data 是 Uint16Array（半精度位模式），须解码成 float，
+      // 否则窗宽会落在位模式区间（如 19328..55616）而非真实值域（-7k..5k）。
+      const decode = data instanceof Uint16Array
+        ? (v) => THREE.DataUtils.fromHalfFloat(v)
+        : (v) => v;
       const step = Math.max(1, Math.floor(data.length / 30000));
-      for (let i = 0; i < data.length; i += step) samples.push(data[i]);
+      for (let i = 0; i < data.length; i += step) samples.push(decode(data[i]));
       if (samples.length >= N) break;
     }
     if (samples.length < 1000) return;
@@ -348,7 +413,10 @@ export class VolumeScene {
     this.queued.add(key);
     const [level, x, y, z] = key.split('/').map(Number);
     const t = this.tilesByLevel.get(level)?.idx.get(`${x}/${y}/${z}`);
-    const dist = t ? this.camera.position.distanceTo(t.box.getCenter(this._scratchV)) : 0;
+    // 相机在世界坐标 → 距离用世界点（多测线偏移/镜像）
+    const dist = t
+      ? this.camera.position.distanceTo(this._toWorld(t.box.getCenter(this._scratchV)))
+      : 0;
     this.queue.push({ key, level, dist });
   }
 
@@ -375,7 +443,7 @@ export class VolumeScene {
         this.loaded.add(key);
         const mesh = this.createMesh(key, tile);
         this.meshes.set(key, mesh);
-        this.cache.set(key, { mesh, key });
+        this.cache.set(this._ck(key), { mesh, key: this._ck(key) });
         // 不入场景：统一由 tick() 按 fallback 规则决定加入时机
         // （避免细瓦片绕过祖先检查、与过渡期 coarse fallback 双重重叠渲染）。
         this.version++;
@@ -399,6 +467,7 @@ export class VolumeScene {
       steps: this.stepsFor(tile),
     });
     mesh.userData.key = key;
+    mesh.userData.lineIdx = this.lineIdx; // 跨线 renderOrder 稳定排序 tie-breaker
     return mesh;
   }
 
@@ -421,22 +490,25 @@ export class VolumeScene {
     const li = this.meta.levelInfo(tile.header.level);
     const [sx, sy, sz] = li.spacing;
     const [ox, oy, oz] = this.meta.origin;
-    // 与 createBrickMesh 的 wmin + size/2 一致（ghost 只影响纹理坐标，不影响世界位置）
-    return new THREE.Vector3(
+    // 与 createBrickMesh 的 wmin + size/2 一致（ghost 只影响纹理坐标，不影响世界位置）。
+    // 返回世界坐标：多测线 worldOffset 平移 + 反向线 direction 镜像（stepsFor 距离用）。
+    const v = new THREE.Vector3(
       ox + (tile.header.x * this.meta.tileW + tile.coreSize[0] / 2) * sx,
       oy + (tile.header.y * this.meta.tileH + tile.coreSize[1] / 2) * sy,
       oz + (tile.header.z * this.meta.tileD + tile.coreSize[2] / 2) * sz
     );
+    return this._toWorld(v);
   }
 
   tileUrl(level, x, y, z) {
     const base = this.meta.storage.tilePath
       .replace('{level}', level).replace('{x}', x).replace('{y}', y).replace('{z}', z);
-    return `/dataset/${base}`;
+    return `${this.basePath}/${base}`;
   }
 
-  // ---- 渲染循环 ----
+  // ---- 渲染循环（仅 self 模式；多测线由宿主驱动）----
   start() {
+    if (!this.ownsRender) return;
     this.frameCamera();
     requestAnimationFrame(this.loop);
   }
@@ -449,12 +521,12 @@ export class VolumeScene {
   }
 
   dispose() {
-    window.removeEventListener('resize', this.resize);
+    if (this.ownsRender) window.removeEventListener('resize', this.resize);
     for (const mesh of this.meshes.values()) {
-      this.scene.remove(mesh);
+      this.group.remove(mesh);
       mesh.material.uniforms.uVolume.value.dispose();
       mesh.material.dispose();
     }
-    this.renderer.dispose();
+    if (this.ownsRender) this.renderer.dispose();
   }
 }

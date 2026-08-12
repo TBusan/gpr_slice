@@ -60,7 +60,19 @@ bool WriteMetadataFile(const std::string& outDirUtf8, const Metadata& meta) {
         jl["scale"] = {l.sx, l.sy, l.sz};
         jl["dimensions"] = {l.nx, l.ny, l.nz};
         jl["spacing"] = {l.spx, l.spy, l.spz};
+        jl["kernel"] = l.kernel;
         j["levels"].push_back(jl);
+    }
+
+    if (meta.hasSliceLevel) {
+        const auto& l = meta.sliceLevel;
+        j["sliceLevel"] = {
+            {"level", l.level},
+            {"scale", {l.sx, l.sy, l.sz}},
+            {"dimensions", {l.nx, l.ny, l.nz}},
+            {"spacing", {l.spx, l.spy, l.spz}},
+            {"kernel", l.kernel},
+        };
     }
 
     j["storage"]["tilePath"] = "tiles/{level}/{x}/{y}/{z}.gvt";

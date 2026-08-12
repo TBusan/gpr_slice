@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GPR 三维体渲染查看器</title>
+  <link rel="icon" href="data:," />
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden;
                  font-family: system-ui, "Microsoft YaHei", sans-serif; background: #111; color: #ddd; }
@@ -22,6 +23,15 @@
     .panel .val { width: 56px; text-align: right; color: #9cd; font-variant-numeric: tabular-nums; }
 
     #stylePanel { position: absolute; top: 10px; right: 10px; width: 210px; }
+    /* 测线可见性面板（多线模式用；单线模式隐藏） */
+    #linePanel { position: absolute; top: 330px; right: 10px; width: 210px;
+                 max-height: 42vh; overflow-y: auto; display: none; }
+    #lineList { display: flex; flex-direction: column; gap: 3px; }
+    #lineList label { display: flex; align-items: center; gap: 6px; font-size: 11px;
+                      justify-content: flex-start; margin: 0; }
+    #lineList .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+    #lineList input[type=checkbox] { flex: none; }
+    #lineList .lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #mapPanel   { position: absolute; bottom: 10px; right: 10px; width: 240px; height: 190px;
                   display: flex; flex-direction: column; gap: 4px; }
     #mapPanel canvas { flex: 1; width: 100%; background: #0d1117; border-radius: 4px; }
@@ -56,9 +66,15 @@
     <div id="hud"></div>
     <div id="status">加载中…</div>
     <div id="stylePanel" class="panel"></div>
+    <div id="linePanel" class="panel"><h3>测线可见性</h3><div id="lineList"></div></div>
     <div id="mapPanel" class="panel"><h3>UTM 轨迹</h3></div>
     <div id="slicePanel" class="panel">
       <div class="slice-controls">
+        <label>测线 <select id="lineSelect" title="B-Scan 数据源"></select></label>
+        <label>C-Scan <select id="cscanMode">
+          <option value="single">单线</option>
+          <option value="composite">全宽合成</option>
+        </select></label>
         <label>通道 <input type="range" id="chanSlider" min="0" max="13" value="0"></label>
         <label>深度 <input type="range" id="depthSlider" min="0" max="0" value="0"></label>
       </div>
