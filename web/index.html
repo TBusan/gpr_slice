@@ -32,11 +32,13 @@
     #lineList .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
     #lineList input[type=checkbox] { flex: none; }
     #lineList .lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #mapPanel   { position: absolute; bottom: 10px; right: 10px; width: 240px; height: 190px;
+    #mapPanel   { position: absolute; bottom: 10px; right: 10px; width: 240px; height: 212px;
                   display: flex; flex-direction: column; gap: 4px; }
     #mapPanel canvas { flex: 1; width: 100%; background: #0d1117; border-radius: 4px; }
+    /* 跨轨放大滑块（多线模式显示；单线隐藏） */
+    #gpsZoomWrap { display: none; margin: 2px 0 0; }
     /* 视口右下角坐标轴方向指示器（mapPanel 上方，点击平面切换前/俯/左视图） */
-    #viewCube { position: absolute; right: 12px; bottom: 212px; width: 108px; height: 108px;
+    #viewCube { position: absolute; right: 12px; bottom: 234px; width: 108px; height: 108px;
                 background: rgba(15,17,22,0.72); border: 1px solid #333; border-radius: 8px;
                 cursor: pointer; user-select: none; overflow: hidden; }
     #viewCube canvas { width: 100%; height: 100%; display: block; }
@@ -67,7 +69,12 @@
     <div id="status">加载中…</div>
     <div id="stylePanel" class="panel"></div>
     <div id="linePanel" class="panel"><h3>测线可见性</h3><div id="lineList"></div></div>
-    <div id="mapPanel" class="panel"><h3>UTM 轨迹</h3></div>
+    <div id="mapPanel" class="panel"><h3>UTM 轨迹</h3>
+      <label id="gpsZoomWrap" title="跨轨放大倍数（0=自动，>0=固定倍数）">跨轨放大
+        <input type="range" id="gpsZoomSlider" min="0" max="100" step="1" value="0">
+        <span class="val" id="gpsZoomVal">自动</span>
+      </label>
+    </div>
     <div id="slicePanel" class="panel">
       <div class="slice-controls">
         <label>测线 <select id="lineSelect" title="B-Scan 数据源"></select></label>

@@ -28,7 +28,9 @@ export class MultiLineHost {
     this.lineCfgs = lineCfgs;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // DPR 封顶 1.0（原 2.0）：当前 dpr=1.25 → 渲染像素降 ~36%，为弱核显多留
+    // 余量，避免加载爆发期 GPU 卡死；fit-all 视觉无损。近景锐度敏感可后续放宽。
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
     renderer.setClearColor(0x0b0d12, 1);
     container.appendChild(renderer.domElement);
     this.renderer = renderer;

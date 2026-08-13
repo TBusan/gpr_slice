@@ -144,6 +144,18 @@ async function bootMulti(manifest) {
     worldXRange: hostWorldXRange(host),
     getCameraX: () => host.camera.position.x,
   });
+  // 跨轨放大滑块：0=自动（现有启发式），>0=固定倍数
+  const gpsZoomWrap = document.getElementById('gpsZoomWrap');
+  const gpsZoomSlider = document.getElementById('gpsZoomSlider');
+  const gpsZoomVal = document.getElementById('gpsZoomVal');
+  gpsZoomWrap.style.display = 'flex';
+  const gpsZoomSync = () => {
+    const f = Number(gpsZoomSlider.value);
+    gpsMapView.setCrossTrackFactor(f);
+    gpsZoomVal.textContent = f === 0 ? '自动' : `${f}×`;
+  };
+  gpsZoomSlider.addEventListener('input', gpsZoomSync);
+  gpsZoomSync();
   const viewCube = new ViewCube(document.getElementById('viewCube'), host);
 
   (function frame() {

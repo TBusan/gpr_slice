@@ -38,8 +38,10 @@ uniform sampler3D uVolume;
 uniform vec3  uStoreSize;   // 存储尺寸（含 ghost）
 uniform vec3  uCoreSize;    // 核心尺寸
 uniform float uGhost;
-uniform vec3  uBoxMin;      // 核心区世界最小角
-uniform vec3  uBoxSize;     // 核心区世界尺寸
+uniform vec3  uBoxMin;      // 核心区【局部】最小角（世界→局部由 uWorldOffset/uMirrorX 还原）
+uniform vec3  uBoxSize;     // 核心区【局部】尺寸
+uniform vec3  uWorldOffset; // 测线世界平移（多测线 worldOffset；单线 [0,0,0]）
+uniform float uMirrorX;     // 测线方向（±1，反向线 x 镜像；单线 +1）
 uniform sampler2D uColorMap;
 uniform float uMinValue;
 uniform float uMaxValue;
@@ -64,8 +66,17 @@ vec2 rayBox(vec3 ro, vec3 rd) {
 }
 
 void main() {
-  vec3 ro = (cameraPosition - uBoxMin) / uBoxSize;   // 相机在局部坐标
-  vec3 rd = (vWorldPos - uBoxMin) / uBoxSize - ro;   // 指向片元的局部方向
+  // cameraPosition / vWorldPos 是世界坐标（含 group 的 worldOffset 平移 + direction 镜像），
+  // uBoxMin/uBoxSize 是【局部】坐标。先把世界坐标逆变换回局部体坐标再算射线，
+  // 否则射线偏出单位立方体 → 瓦片片元级不可见（误差随相机 X 变化 → 旋转时闪现）。
+  vec3 lCam  = vec3((cameraPosition.x - uWorldOffset.x) * uMirrorX,
+                    cameraPosition.y - uWorldOffset.y,
+                    cameraPosition.z - uWorldOffset.z);
+  vec3 lFrag = vec3((vWorldPos.x - uWorldOffset.x) * uMirrorX,
+                    vWorldPos.y - uWorldOffset.y,
+                    vWorldPos.z - uWorldOffset.z);
+  vec3 ro = (lCam  - uBoxMin) / uBoxSize;   // 相机在局部坐标
+  vec3 rd = (lFrag - uBoxMin) / uBoxSize - ro;   // 指向片元的局部方向
 
   vec2 tb = rayBox(ro, rd);
   float tNear = max(tb.x, 0.0);
@@ -145,6 +156,8 @@ export function createBrickMesh(tile, meta, style, opts = {}) {
       uGhost: { value: g },
       uBoxMin: { value: wmin.clone() },
       uBoxSize: { value: size.clone() },
+      uWorldOffset: { value: new THREE.Vector3(...(opts.worldOffset || [0, 0, 0])) },
+      uMirrorX: { value: opts.direction ?? 1 },
       uColorMap: { value: style.colorMap },
       uMinValue: { value: style.minValue },
       uMaxValue: { value: style.maxValue },

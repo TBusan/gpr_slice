@@ -654,6 +654,8 @@ export class VolumeScene {
       linear: this.linearOK,
       geometry: this.sharedGeo,
       steps: this.stepsFor(tile),
+      worldOffset: this.worldOffset,   // shader 世界→局部逆变换用
+      direction: this.direction,       // shader 反向线 x 镜像用
     });
     mesh.userData.key = key;
     mesh.userData.lineIdx = this.lineIdx; // 跨线 renderOrder 稳定排序 tie-breaker
@@ -661,9 +663,14 @@ export class VolumeScene {
     return mesh;
   }
 
-  // 自适应步数：砖在屏幕上的投影尺寸 → 每像素约 1.5 步。
-  // 远景细级砖被 LOD 覆盖得只剩几十像素，走 254+ 步纯属浪费；
-  // 近景满步以保证 Z 向细节。clamp [16, 192]。
+  // 自适应步数：砖在屏幕上的投影尺寸 → 步数预算。
+  // 注意！步数过高会在 12 线全载（1104 片）时把 Intel UHD 核显 GPU 永久卡到 1Hz，
+  // 且该卡死是【粘滞】的——事后调低 uSteps 也救不回，只能整页重载。因此：
+  //   - 曲线压低（0.3 步/投影像素，原 1.5）；
+  //   - 硬上限 16（原 192，实测 32 步在冷启动全载时仍卡死，cliff 在 16~22 步）。
+  // 定标记录：持续 16 步 → 12 线全部加载后 166 FPS；fit-all 时瓦片亚像素，
+  // 16 步足够。近景同样被 16 步封顶，深度方向略粗但可接受（GPR 深度薄、
+  // 表面反射主导）。
   stepsFor(tile) {
     const h = this.renderer.domElement.clientHeight || 800;
     const k = h / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
@@ -673,7 +680,7 @@ export class VolumeScene {
     const worldX = tile.coreSize[0] * sx;
     const worldZ = tile.coreSize[2] * sz;
     const proj = Math.max(worldX, worldZ) * k / d;
-    return Math.max(16, Math.min(192, Math.round(proj * 1.5)));
+    return Math.max(8, Math.min(16, Math.round(proj * 0.3)));
   }
 
   tileWorldCenter(tile) {

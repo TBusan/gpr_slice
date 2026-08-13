@@ -28,6 +28,8 @@ export class GpsMapView {
     this.refTrack = cfg.refTrack || (this.tracks[0] && this.tracks[0].pts) || [];
     this.worldXRange = cfg.worldXRange || [0, 1];
     this.getCameraX = cfg.getCameraX || (() => 0);
+    // 跨轨放大倍数：0=自动（窄轴夸大到图幅短边 70%），>0=固定倍数（UI 滑块可调）。
+    this.crossTrackFactor = cfg.crossTrackFactor || 0;
 
     // 每条轨迹的累计弧长（点插值用）
     this.cums = this.tracks.map(pts => {
@@ -93,6 +95,13 @@ export class GpsMapView {
     this.draw();
   }
 
+  // UI 滑块调用：设置跨轨放大倍数（0=自动，>0=固定倍数），立即重绘。
+  setCrossTrackFactor(f) {
+    this.crossTrackFactor = f || 0;
+    this._lastXFrac = null; // 使 update() 跳过"未变化"检查，下一帧重绘
+    this.draw();
+  }
+
   draw() {
     const canvas = this.canvas;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -125,11 +134,29 @@ export class GpsMapView {
       if (n > n1) n1 = n;
     }
     const pad = 14;
-    const s = Math.min((cw - 2 * pad) / (e1 - e0 || 1), (ch - 2 * pad) / (n1 - n0 || 1));
-    const ox = (cw - (e1 - e0) * s) / 2;
-    const oy = (ch - (n1 - n0) * s) / 2;
-    const X = (e) => ox + (e - e0) * s;
-    const Y = (n) => ch - (oy + (n - n0) * s);
+    // 统一 fit 会把窄轴（跨轨，如 50m）压扁到 ~3px，12 条平行测线叠成一条。
+    // 逐轴缩放：自动模式把窄轴（跨轨）夸大到图幅短边 ~70%，使测线分开可见
+    // （示意性夸大，非地理精确；沿轨轴仍按真实比例铺满）。
+    // 固定倍数模式（crossTrackFactor>0）：跨轨轴按 base×factor 放大，封顶避免
+    // 溢出画布（此时"跨轨 ×N"标注显示实际生效倍数）。
+    const dE = e1 - e0 || 1, dN = n1 - n0 || 1;
+    const base = Math.min((cw - 2 * pad) / dE, (ch - 2 * pad) / dN);
+    let sE = base, sN = base, exaggerate = 1;
+    const fix = this.crossTrackFactor || 0;
+    if (fix > 0) {
+      if (dE < dN) { sE = Math.min(base * fix, (cw - 2 * pad) / dE); exaggerate = sE / base; }
+      else if (dN < dE) { sN = Math.min(base * fix, (ch - 2 * pad) / dN); exaggerate = sN / base; }
+    } else if (dE < dN * 0.25) {        // 自动：E 为跨轨（道路近南北向）
+      sE = Math.max(sE, (ch * 0.7) / dE);
+      exaggerate = sE / base;
+    } else if (dN < dE * 0.25) {        // 自动：N 为跨轨（道路近东西向）
+      sN = Math.max(sN, (ch * 0.7) / dN);
+      exaggerate = sN / base;
+    }
+    const ox = (cw - dE * sE) / 2;
+    const oy = (ch - dN * sN) / 2;
+    const X = (e) => ox + (e - e0) * sE;
+    const Y = (n) => ch - (oy + (n - n0) * sN);
 
     // 各测线轨迹折线
     for (const t of this.tracks) {
@@ -166,6 +193,10 @@ export class GpsMapView {
     ctx.fillText(`E ${e0.toFixed(0)}`, 4, ch - 4);
     ctx.fillText(`N ${n0.toFixed(0)}`, 4, 10);
     ctx.fillText(`E ${e1.toFixed(0)}`, cw - 70, ch - 4);
+    if (exaggerate > 1.01) {
+      ctx.fillStyle = '#667';
+      ctx.fillText(`跨轨 ×${Math.round(exaggerate)}`, 4, 20);
+    }
     if (this.tracks.length > 1) {
       ctx.font = '8px system-ui';
       const lx = cw - 70, ly = 24;
