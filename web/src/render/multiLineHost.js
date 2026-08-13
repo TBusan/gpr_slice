@@ -9,12 +9,17 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TileCache } from '../lod/tileCache.js';
+import { createLimiter } from '../lod/limiter.js';
 import { VolumeScene } from './volumeScene.js';
 
 // 满 tile 纹理 = 258×34×34×2B（HalfFloat，store 含 ghost=1）≈ 0.57MB；
 // CACHE_LIMIT 1280 块 ≈ 728MB GPU 上限。全览 12 线粗级 1104 片 ≈ 630MB，
 // 典型 3D 视锥 300–700 片 ≈ 170–400MB。实测全览 ~1009 纹理 ≈ 575MB。
 const CACHE_LIMIT = 1280;
+// 缓存容量自适应上限：中距离视锥同时看到 12 线的细级瓦片时 desired 可达 ~2000+，
+// 若缓存仍按 1280 硬上限，LRU 会反复淘汰 desired 瓦片 → 重载 → 画面闪烁/加载慢。
+// 逐帧把共享缓存上限扩到「各线 desired 总和 + 余量」，封顶 CACHE_CAP（~4096 片 ≈ 2.3GB GPU）。
+const CACHE_CAP = 4096;
 
 export class MultiLineHost {
   constructor(container, lineCfgs) {
@@ -40,8 +45,13 @@ export class MultiLineHost {
       !!renderer.extensions.get('OES_texture_half_float_linear');
 
     this.cache = new TileCache(CACHE_LIMIT);
+    // 全局瓦片加载并发预算：12 线各自 6 并发 = 72 在途请求排队等 ~6 浏览器连接，
+    // 缩放后新 desired 瓦片要等全部过期请求走完才轮到。全局压到 ~9，配合
+    // drainQueue 的 desired 过滤，过期请求不占连接，新瓦片更快拿到连接。
+    const limiter = createLimiter(9);
     const shared = {
       renderer, scene: this.scene, camera: this.camera, controls: this.controls, cache: this.cache,
+      limiter,
     };
 
     this.views = lineCfgs.map((cfg, i) => {
@@ -67,6 +77,7 @@ export class MultiLineHost {
     this.lastFpsAt = 0;
     this.fps = 0;
     this._autoFitted = false; // 多线显示窗宽只自动适配一次
+    this._all = [];           // 跨线排序持久数组：复用，避免每帧新建上千对象
     this.loop = this.loop.bind(this);
   }
 
@@ -118,11 +129,23 @@ export class MultiLineHost {
     const visible = this.views.filter(v => v.visible);
     for (const v of visible) v.tick();
 
+    // 缓存容量自适应：多线工作集 = 各线 desired 总和。超过当前缓存上限时逐帧扩
+    // 大共享缓存（封顶 CACHE_CAP），避免 desired > cache 时 LRU 反复淘汰 desired
+    // 瓦片 → 移除场景 → 重新拉取 → 画面来回闪烁、加载变慢。只增不减（LRU 不缩容）。
+    let totalDesired = 0;
+    for (const v of visible) totalDesired += v.desired.size;
+    if (totalDesired > this.cache.limit && totalDesired < CACHE_CAP) {
+      this.cache.limit = totalDesired + 64;
+    }
+
     // 跨线全局背向排序（远→近），renderOrder 递增；距离并列按 lineIdx 稳定排序。
     // mesh.userData.center 是局部坐标 → 按各线 worldOffset/direction 转世界点再算距离
     // （反向线镜像 + 跨轨偏移，否则排序基准全错）。
+    // 复用持久数组 + 每 mesh 持久排序记录（userData._sortRec）：每帧只更新 dsq、不新建对象，
+    // 消除上千对象/帧的 GC 压力；排序仍每帧做，保证相机移动时混合顺序正确。
     const cam = this.camera.position;
-    const all = [];
+    const all = this._all;
+    all.length = 0;
     for (const v of visible) {
       const [ox, oy, oz] = v.worldOffset;
       const dir = v.direction;
@@ -133,7 +156,9 @@ export class MultiLineHost {
         const wy = oy + c.y;
         const wz = oz + c.z;
         const dx = wx - cam.x, dy = wy - cam.y, dz = wz - cam.z;
-        all.push({ m, dsq: dx * dx + dy * dy + dz * dz });
+        const rec = m.userData._sortRec || (m.userData._sortRec = { m, dsq: 0 });
+        rec.dsq = dx * dx + dy * dy + dz * dz;
+        all.push(rec);
       }
     }
     all.sort((a, b) => {

@@ -61,6 +61,8 @@ export class SliceView {
       line.slabZ = -1;
       line.fullGen = 0;
       line.slabGen = 0;
+      line.slabLoading = false; // 有在途 slab 加载（防 _syncSlabs 每帧重启）
+      line.slabLoadId = 0;      // 批次令牌：作废在途加载的 .then 回调
       line.version = 0;
     });
 
@@ -144,7 +146,10 @@ export class SliceView {
     const line = this.lines.find(l => l.id === lineId);
     if (!line || line.visible === visible) return;
     line.visible = visible;
-    if (!visible) { line.slabGen++; line.slab.clear(); line.version++; }
+    if (!visible) {
+      line.slabGen++; line.slab.clear(); line.version++;
+      line.slabZ = -1; line.slabLoading = false; line.slabLoadId++;
+    }
     this._computeComposite();
     this._version++;
     this._dirty = true;
@@ -215,10 +220,13 @@ export class SliceView {
       const nz = Math.ceil(li.dims[2] / tileD);
       if (zTile < 0 || zTile >= nz) { // 该线在此深度无数据（如 011-016 较浅）
         if (line.slab.size) { line.slabGen++; line.slab.clear(); line.version++; }
+        else line.slabGen++;          // 无数据也作废在途加载（正加载旧 zTile）
+        line.slabLoadId++;            // 作废在途加载的 .then 回调
+        line.slabLoading = false;
         line.slabZ = zTile;
         continue;
       }
-      if (line.slabZ === zTile && line.slab.size > 0) continue;
+      if (line.slabZ === zTile && (line.slab.size > 0 || line.slabLoading)) continue;
       line.slabZ = zTile;
       line.slabGen++;
       line.slab.clear();
@@ -229,7 +237,11 @@ export class SliceView {
       for (let ty = 0; ty < ny; ty++)
         for (let tx = 0; tx < nx; tx++)
           keys.push(`${L}/${tx}/${ty}/${zTile}`);
-      this._loadKeys(line, line.slab, 'slabGen', keys);
+      const loadId = ++line.slabLoadId;
+      line.slabLoading = true;
+      this._loadKeys(line, line.slab, 'slabGen', keys)
+        .then(() => { if (line.slabLoadId === loadId) line.slabLoading = false; })
+        .catch(() => { if (line.slabLoadId === loadId) line.slabLoading = false; });
     }
   }
 
@@ -261,7 +273,7 @@ export class SliceView {
         }
       }
     };
-    Promise.all(Array.from({ length: Math.min(CONCURRENT, Math.max(1, keys.length)) }, worker));
+    return Promise.all(Array.from({ length: Math.min(CONCURRENT, Math.max(1, keys.length)) }, worker));
   }
 
   tileUrlFor(line, level, x, y, z) {
