@@ -24,7 +24,7 @@ bool WriteMetadataFile(const std::string& outDirUtf8, const Metadata& meta) {
     j["dataset"]["id"] = meta.datasetId;
     j["dataset"]["name"] = meta.datasetName;
 
-    j["volume"]["dimensions"] = {meta.lod0->nx, meta.lod0->ny, meta.lod0->nz};
+    j["volume"]["dimensions"] = {meta.lod0Nx, meta.lod0Ny, meta.lod0Nz};
     j["volume"]["voxelType"] = "int16";
     j["volume"]["axisOrder"] = {"x", "y", "z"};
 

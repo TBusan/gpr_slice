@@ -1,21 +1,6 @@
 #include "volume.h"
 
-#include <climits>
-
 namespace gvt {
-
-void VolumeMinMax(const Volume& vol, int16_t& outMin, int16_t& outMax) {
-    if (vol.v.empty()) {
-        outMin = outMax = 0;
-        return;
-    }
-    int mn = INT16_MAX, mx = INT16_MIN;
-    for (int16_t val : vol.v) {
-        if (val < mn) mn = val;
-        if (val > mx) mx = val;
-    }
-    outMin = (int16_t)mn;
-    outMax = (int16_t)mx;
-}
-
+// Volume 为纯头文件结构（见 volume.h），无独立成员定义。
+// VolumeMinMax 已删除（无调用方，死代码）。
 } // namespace gvt

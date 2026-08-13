@@ -26,7 +26,7 @@ struct GpsTrack {
 struct Metadata {
     std::string datasetId;
     std::string datasetName;
-    Volume* lod0 = nullptr;               // LOD0 卷指针（只读，写 metadata 用）
+    int64_t lod0Nx = 0, lod0Ny = 0, lod0Nz = 0; // LOD0 体素尺寸（move 之前取值拷贝，见 main.cpp）
     RegularizedMeta spatial;
     int tileW = 256, tileH = 32, tileD = 32;
     int ghost = 1;

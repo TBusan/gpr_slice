@@ -104,7 +104,8 @@ export class SliceView {
     // 重建门控：瓦片集合（version）或滑块/样式变化才重算网格
     this._lastVersion = -1;
     this._styleKeyCache = null;
-    this._dirty = false;
+    this._dirtyB = false;
+    this._dirtyC = false;
     this._lastRebuildAt = 0;
 
     // 画布→网格 区间表缓存（box-average 用）
@@ -138,7 +139,8 @@ export class SliceView {
     this.depthSlider.value = String(this.depth);
     this._ensureFull(line);
     this._version++;
-    this._dirty = true;
+    this._dirtyB = true;
+    this._dirtyC = true;
     this._updateCaps();
   }
 
@@ -152,14 +154,14 @@ export class SliceView {
     }
     this._computeComposite();
     this._version++;
-    this._dirty = true;
+    this._dirtyC = true;
   }
 
   setCscanMode(mode) {
     if (!this.multi) mode = 'single';
     if (mode === this.cscanMode) return;
     this.cscanMode = mode;
-    this._dirty = true;
+    this._dirtyC = true;
     if (mode === 'composite') this._syncSlabs();
     this._updateCaps();
   }
@@ -171,7 +173,8 @@ export class SliceView {
     line.basePath = basePath;
     line.fullGen++; line.full.clear();
     this._version++;
-    this._dirty = true;
+    this._dirtyB = true;
+    this._dirtyC = true;
     this._ensureFull(line);
   }
 
@@ -304,13 +307,23 @@ export class SliceView {
 
     this.chanSlider.addEventListener('input', () => {
       this.channel = Number(this.chanSlider.value);
-      this._dirty = true;
+      this._dirtyB = true;
       this._updateCaps();
     });
     this.depthSlider.addEventListener('input', () => {
       this.depth = Number(this.depthSlider.value);
-      this._dirty = true;
+      this._dirtyC = true;
       this._updateCaps();
+    });
+    // 松手（change）强制下一次 update 立即重建：拖动节流期间可能停在中间值，
+    // 重置节流时间戳保证终值渲染。
+    this.chanSlider.addEventListener('change', () => {
+      this._dirtyB = true;
+      this._lastRebuildAt = 0;
+    });
+    this.depthSlider.addEventListener('change', () => {
+      this._dirtyC = true;
+      this._lastRebuildAt = 0;
     });
   }
 
@@ -329,18 +342,24 @@ export class SliceView {
     const styleKey = this._styleKey();
     const tilesChanged = this._lastVersion !== this._version;
     const styleChanged = styleKey !== this._styleKeyCache;
-    if (!this._dirty && !tilesChanged && !styleChanged) return;
+    if (!this._dirtyB && !this._dirtyC && !tilesChanged && !styleChanged) return;
 
+    // B/C 独立重建 + 统一 100ms 节流：拖深度滑块不再重建 B-Scan、拖通道滑块不再重建 C-Scan，
+    // 且重建频率封顶 ~10Hz。拖动期间渲染只在重建后发生（省每帧 ~10ms 的画布重绘）。
     const now = performance.now();
-    const doRebuild = this._dirty || (tilesChanged && now - this._lastRebuildAt > 100);
-    if (doRebuild) {
-      this._rebuildB();
+    const canRebuild = now - this._lastRebuildAt > 100;
+    const rebuildB = canRebuild && (this._dirtyB || tilesChanged);
+    const rebuildC = canRebuild && (this._dirtyC || tilesChanged);
+    if (rebuildB) this._rebuildB();
+    if (rebuildC) {
       if (this.cscanMode === 'composite') this._rebuildCComposite();
       else this._rebuildCSingle();
-      this._lastRebuildAt = now;
     }
-    if (styleChanged || this._dirty || (tilesChanged && doRebuild)) {
+    if (rebuildB || rebuildC) this._lastRebuildAt = now;
+    if (styleChanged || rebuildB) {
       this._renderCanvas(this.bCanvas, this.bCtx, this.gridB, this.gridX, this.gridZ);
+    }
+    if (styleChanged || rebuildC) {
       if (this.cscanMode === 'composite')
         this._renderCanvas(this.cCanvas, this.cCtx, this.gridComp, this.compGridX, this.compGridY);
       else
@@ -348,7 +367,8 @@ export class SliceView {
     }
     this._lastVersion = this._version;
     this._styleKeyCache = styleKey;
-    this._dirty = false;
+    this._dirtyB = false;
+    this._dirtyC = false;
   }
 
   // 级别间距：sliceLevel 不在 levelMap（级别号不连续），单独查；其余走 levelMap。

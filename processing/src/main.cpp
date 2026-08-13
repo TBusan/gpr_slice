@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -70,6 +71,9 @@ struct CliArgs {
     int jobs = 0;              // 0 = 自动（min(hardware_concurrency,8)）
     std::string gps;           // 空 = 由 --line 基名派生 .utmgps
     int sliceLod = 2;          // 切片专用 mean-LOD 的降采样次数（相对 LOD0）；0 = 不生成
+    std::string road = "mingxingroad"; // dataset id 前缀（原硬编码）
+    int  utmZone = 51;         // GPS UTM 分带（原硬编码）
+    bool utmNorth = true;      // GPS UTM 北半球（原硬编码）
 };
 
 static bool ParseVec3(const std::string& s, int& a, int& b, int& c) {
@@ -98,8 +102,11 @@ static void PrintHelp() {
         "  gpr2gvt --line <测线基名> [--out <目录>]\n"
         "         [--zero-mode max|channel] [--tile-size W,H,D] [--ghost N]\n"
         "         [--lod-scale X,Y,Z] [--levels N] [--zstd-level N] [--jobs N]\n"
-        "         [--gps <.utmgps 路径>] [--slice-lod N]\n\n"
-        "  --slice-lod N  生成切片专用 mean-LOD（从 LOD0 箱平均 N 次，级别号=levels；0=不生成）\n\n"
+        "         [--gps <.utmgps 路径>] [--slice-lod N]\n"
+        "         [--road <前缀>] [--utm-zone N] [--utm-north 0|1]\n\n"
+        "  --slice-lod N  生成切片专用 mean-LOD（从 LOD0 箱平均 N 次，级别号=levels；0=不生成）\n"
+        "  --road S       dataset id 前缀（默认 mingxingroad）\n"
+        "  --utm-zone N   GPS UTM 分带（默认 51）；--utm-north 0|1 南/北半球（默认 1=北）\n\n"
         "示例:\n"
         "  gpr2gvt --line \"data/mingxingroad/明星路_001\" --out dataset\n"
         "  gpr2gvt --line \"data/mingxingroad/明星路_001\" --gps \"data/mingxingroad/明星路_测试路段_rad.utmgps\"\n");
@@ -161,6 +168,15 @@ static bool ParseArgs(const std::vector<std::string>& args, CliArgs& a) {
         } else if (key == "--slice-lod") {
             if (!needsVal()) return false;
             a.sliceLod = std::atoi(val.c_str());
+        } else if (key == "--road") {
+            if (!needsVal()) return false;
+            a.road = val;
+        } else if (key == "--utm-zone") {
+            if (!needsVal()) return false;
+            a.utmZone = std::atoi(val.c_str());
+        } else if (key == "--utm-north") {
+            if (!needsVal()) return false;
+            a.utmNorth = (std::atoi(val.c_str()) != 0);
         } else if (key == "--help" || key == "-h") {
             PrintHelp();
             return false;
@@ -202,6 +218,14 @@ static std::vector<std::string> EnumerateChannels(const std::string& lineBaseUtf
         found.push_back({num, entry.path().u8string()});
     }
     std::sort(found.begin(), found.end());
+    // 去重校验：atoi 会把 "A01"/"A1" 都解析成 1；重复通道号报错退出（否则静默丢通道）。
+    for (size_t i = 1; i < found.size(); ++i) {
+        if (found[i].first == found[i - 1].first) {
+            std::fprintf(stderr, "[error] 重复通道号 A%02d: %s\n",
+                         found[i].first, fs::u8path(found[i].second).filename().u8string().c_str());
+            return {};
+        }
+    }
     std::vector<std::string> out;
     for (auto& p : found) out.push_back(p.second);
     return out;
@@ -222,6 +246,7 @@ static void ParseUtmTrack(const std::string& pathUtf8, GpsTrack& out) {
         if (n != 9) continue;
         const double e = (v[0] + v[2] + v[4] + v[6]) / 4.0;
         const double nor = (v[1] + v[3] + v[5] + v[7]) / 4.0;
+        if (!(std::isfinite(e) && std::isfinite(nor))) continue; // 坏行（NaN/Inf）→ 跳过，防质心 NaN 污染 GPS
         out.utmPoints.push_back({e, nor});
     }
 }
@@ -234,6 +259,16 @@ int main() {
     std::vector<std::string> args = GetUtf8Args();
     CliArgs a;
     if (!ParseArgs(args, a)) return 1;
+
+    // 瓦片存储尺寸（core + 2*ghost）必须 < 65536：GvtHeader.width/height/depth 是 uint16_t，
+    // 超限会静默溢出为 0 → 损坏瓦片。显式校验。
+    if (a.tileW + 2 * a.ghost > 65535 ||
+        a.tileH + 2 * a.ghost > 65535 ||
+        a.tileD + 2 * a.ghost > 65535) {
+        std::fprintf(stderr, "[error] 瓦片尺寸 + 2*ghost 超 uint16 上限（65535）：%d,%d,%d ghost=%d\n",
+                     a.tileW, a.tileH, a.tileD, a.ghost);
+        return 1;
+    }
 
     const int nworkers = (a.jobs > 0) ? a.jobs
         : std::max(1, std::min((int)std::thread::hardware_concurrency(), 8));
@@ -322,17 +357,20 @@ int main() {
 
     // 5. GPS 轨迹
     Metadata md;
-    // datasetId 由 --line 基名派生：取 "_NNN" 数字后缀，前缀固定道路拼音。
+    // datasetId 由 --line 基名派生：取 "_NNN" 数字后缀，前缀由 --road 指定。
     // 例如 明星路_002 → mingxingroad_002（与 dataset/lines/manifest.json 的 id 一致）。
     {
         const std::string base = fs::u8path(a.line).filename().u8string();
         std::string lineNum;
         if (auto pos = base.rfind('_'); pos != std::string::npos && pos + 1 < base.size())
             lineNum = base.substr(pos + 1);
-        md.datasetId = "mingxingroad_" + (lineNum.empty() ? "line" : lineNum);
+        md.datasetId = a.road + "_" + (lineNum.empty() ? "line" : lineNum);
     }
     md.datasetName = fs::u8path(a.line).filename().u8string();
-    md.lod0 = &vol0;
+    // LOD0 体素尺寸：在 vol0 被 move 进 current 之前取值的拷贝（不再持有悬空指针）。
+    md.lod0Nx = vol0.nx;
+    md.lod0Ny = vol0.ny;
+    md.lod0Nz = vol0.nz;
     md.spatial = meta;
     md.tileW = a.tileW;
     md.tileH = a.tileH;
@@ -352,6 +390,8 @@ int main() {
                 std::fprintf(stderr, "[warn] 未找到 GPS 文件（可 --gps 指定）: %s\n", gpsPath.c_str());
         }
         ParseUtmTrack(gpsPath, md.gps);
+        md.gps.utmZone = a.utmZone;
+        md.gps.utmHemisphereN = a.utmNorth;
         std::printf("GPS 轨迹: %zu 点 (%s)\n", md.gps.utmPoints.size(), gpsPath.c_str());
     }
 

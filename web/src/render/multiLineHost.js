@@ -133,11 +133,15 @@ export class MultiLineHost {
 
     // 缓存容量自适应：多线工作集 = 各线 desired 总和。超过当前缓存上限时逐帧扩
     // 大共享缓存（封顶 CACHE_CAP），避免 desired > cache 时 LRU 反复淘汰 desired
-    // 瓦片 → 移除场景 → 重新拉取 → 画面来回闪烁、加载变慢。只增不减（LRU 不缩容）。
+    // 瓦片 → 移除场景 → 重新拉取 → 画面来回闪烁、加载变慢。
+    // 缩容带迟滞：工作集回落到当前上限 60% 以下才降，避免视锥来回摆时反复扩缩。
     let totalDesired = 0;
     for (const v of visible) totalDesired += v.desired.size;
     if (totalDesired > this.cache.limit && totalDesired < CACHE_CAP) {
       this.cache.limit = totalDesired + 64;
+    } else if (this.cache.limit > CACHE_LIMIT && totalDesired < this.cache.limit * 0.6) {
+      this.cache.limit = Math.max(CACHE_LIMIT, totalDesired + 64);
+      this.cache.trim(); // 降 limit 后须显式 trim（tileCache.trim 只在 set() 时自动触发）
     }
 
     // 跨线全局背向排序（远→近），renderOrder 递增；距离并列按 lineIdx 稳定排序。

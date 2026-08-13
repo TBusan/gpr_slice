@@ -118,6 +118,7 @@ export class VolumeScene {
 
     this._transitions = new Map(); // key -> { mesh, mode, start, dur, from }：LOD 交叉淡入淡出登记
     this._grace = new Map();       // key -> 连续不在 desired 且移出视锥的帧数（延迟移除滞回）
+    this._ancCache = new Map();    // key -> 祖先 key 数组（_ancestorsOf 记忆化；瓦片空间有界，无需清理）
 
     this.limiter = this.shared ? (this.shared.limiter || null) : null; // 全局瓦片加载并发预算（多线共享；self 模式用 MAX_IN_FLIGHT）
 
@@ -245,23 +246,24 @@ export class VolumeScene {
 
   // 瓦片（局部 box）是否在视锥内：区分「视锥内错误 LOD → 立即交叉替换」与
   // 「移出视锥 → 延迟移除（滞回）」。box 从 tile index O(1) 查，复用 _frustumTest。
-  _inFrustum(key) {
-    const p = key.split('/');
-    const lv = this.tilesByLevel.get(+p[0]);
-    const t = lv && lv.idx.get(`${p[1]}/${p[2]}/${p[3]}`);
+  _inFrustum(mesh) {
+    const t = mesh.userData.tileRef; // createMesh 缓存的 tile index 对象（零每帧字符串）
     if (!t) return true; // 查不到（理论上已加载必有）→ 按在视锥内处理，走立即替换
     return this._frustumTest(t.box);
   }
 
   // 向上走祖先：返回 key 的所有更粗祖先（"level/x/y/z"，X/Z 各减半），到 maxLevel 为止。
   _ancestorsOf(key) {
+    let res = this._ancCache.get(key);
+    if (res) return res;
     const p = key.split('/');
     let L = +p[0], x = +p[1], y = +p[2], z = +p[3];
-    const res = [];
+    res = [];
     while (L < this.meta.maxLevel) {
       L++; x >>= 1; z >>= 1;
       res.push(kkey(L, x, y, z));
     }
+    this._ancCache.set(key, res);
     return res;
   }
 
@@ -414,7 +416,7 @@ export class VolumeScene {
         this.cache.get(this._ck(key)); // fallback 也保护，防止 LRU 淘汰
       } else if (this._transitions.has(key)) {
         continue; // 正在淡出：交给过渡推进
-      } else if (this._inFrustum(key)) {
+      } else if (this._inFrustum(mesh)) {
         // 视锥内但 LOD 错误：立即走交叉淡出替换（放大/缩小的正常切换路径）
         this._grace.delete(key);
         toRemove.push([key, mesh]);
@@ -525,11 +527,12 @@ export class VolumeScene {
     // 样式指纹门控：8 项参数未变则跳过逐 mesh 的 uniform 写入（12 线 × 数百 mesh × 8 uniform
     // 每帧重复写的开销很大）。uOpacity 额外含 LOD fade（每帧可能变），仅在样式变化或该 mesh
     // 正在淡入淡出时写。
-    const fp = `${s.colorMap}|${s.minValue}|${s.maxValue}|${s.gain}|${s.gamma}|${s.thresholdMin}|${s.thresholdMax}|${s.opacity}`;
+    const fp = `${s.colorMapName}|${s.minValue}|${s.maxValue}|${s.gain}|${s.gamma}|${s.thresholdMin}|${s.thresholdMax}|${s.opacity}`;
     const styleChanged = fp !== this._styleFp;
     if (styleChanged) this._styleFp = fp;
     for (const mesh of this.meshes.values()) {
-      if (!mesh.parent) continue; // 只同步场景内可见 mesh；隐藏 mesh 入场景当帧补齐
+      // 样式变化时对全部 mesh 写 uniform（含尚未入场景的 parentless mesh）：
+      // 否则瓦片在样式变化帧之后才入场景（加载完成 / 淡入）时会带着创建时的旧样式渲染。
       const fade = mesh.userData.fade ?? 1;
       if (!styleChanged && fade === 1) continue; // 样式没变且无过渡 → 无需写 uniform
       const u = mesh.material.uniforms;
@@ -624,7 +627,7 @@ export class VolumeScene {
     const p = (async () => {
       try {
         if (limiter) await limiter.acquire();
-        const tile = await loadTile(url, { ghost: this.meta.ghost, scale: 1, offset: 0 });
+        const tile = await loadTile(url, { ghost: this.meta.ghost, scale: 1, offset: 0, half: true });
         this.inFlight.delete(key);
         this.queued.delete(key);
         this.loaded.add(key);
@@ -660,27 +663,23 @@ export class VolumeScene {
     mesh.userData.key = key;
     mesh.userData.lineIdx = this.lineIdx; // 跨线 renderOrder 稳定排序 tie-breaker
     mesh.userData.fade = 1; // LOD 交叉淡入淡出乘数（默认全不透明）
+    // 每帧 LOD 判定缓存：避免 _inFrustum/_ancestorsOf 每帧重复 split key（一次创建，非每帧）。
+    const [L, x, y, z] = key.split('/').map(Number);
+    mesh.userData.parts = [L, x, y, z];
+    mesh.userData.tileRef = this.tilesByLevel.get(L)?.idx.get(`${x}/${y}/${z}`) || null;
     return mesh;
   }
 
-  // 自适应步数：砖在屏幕上的投影尺寸 → 步数预算。
+  // 步数统一为 16（不再按瓦片投影自适应）：partial 瓦片与满宽瓦片、不同创建时刻的
+  // 瓦片步数一致，消除邻接瓦片采样密度跳变（俯视图拼缝）。
   // 注意！步数过高会在 12 线全载（1104 片）时把 Intel UHD 核显 GPU 永久卡到 1Hz，
-  // 且该卡死是【粘滞】的——事后调低 uSteps 也救不回，只能整页重载。因此：
-  //   - 曲线压低（0.3 步/投影像素，原 1.5）；
-  //   - 硬上限 16（原 192，实测 32 步在冷启动全载时仍卡死，cliff 在 16~22 步）。
+  // 且该卡死是【粘滞】的——事后调低 uSteps 也救不回，只能整页重载。因此硬上限 16
+  // （原 192，实测 32 步在冷启动全载时仍卡死，cliff 在 16~22 步）。
   // 定标记录：持续 16 步 → 12 线全部加载后 166 FPS；fit-all 时瓦片亚像素，
   // 16 步足够。近景同样被 16 步封顶，深度方向略粗但可接受（GPR 深度薄、
   // 表面反射主导）。
-  stepsFor(tile) {
-    const h = this.renderer.domElement.clientHeight || 800;
-    const k = h / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
-    const d = this.camera.position.distanceTo(this.tileWorldCenter(tile));
-    const li = this.meta.levelInfo(tile.header.level);
-    const [sx, , sz] = li.spacing;
-    const worldX = tile.coreSize[0] * sx;
-    const worldZ = tile.coreSize[2] * sz;
-    const proj = Math.max(worldX, worldZ) * k / d;
-    return Math.max(8, Math.min(16, Math.round(proj * 0.3)));
+  stepsFor(_tile) {
+    return 16;
   }
 
   tileWorldCenter(tile) {

@@ -27,7 +27,4 @@ struct Volume {
     }
 };
 
-// 扫描卷的全局 min/max。
-void VolumeMinMax(const Volume& vol, int16_t& outMin, int16_t& outMax);
-
 } // namespace gvt

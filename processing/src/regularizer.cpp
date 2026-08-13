@@ -63,11 +63,14 @@ void Regularize(const std::vector<ChannelHeader>& headers,
                 int16_t val = 0;
                 if (x < n) {
                     const int s = perChannel ? (zeroCh + (int)z) : (commonStart + (int)z);
-                    if (s >= 0 && s < samples) val = src[row + s];
+                    if (s >= 0 && s < samples) {
+                        val = src[row + s];
+                        // 只统计真实采样：越界/padding 的 0 不计入全局 min/max（否则污染统计）。
+                        if (val < mn) mn = val;
+                        if (val > mx) mx = val;
+                    }
                 }
                 outVol.At(x, y, z) = val;
-                if (val < mn) mn = val;
-                if (val > mx) mx = val;
             }
         }
         std::fprintf(stderr, "  [ch] Y=%d 通道#%d trace=%lld xOff=%+.3f 已就位\n",
@@ -75,6 +78,16 @@ void Regularize(const std::vector<ChannelHeader>& headers,
     }
     outMin = (mn == INT16_MAX) ? 0 : (int16_t)mn;
     outMax = (mx == INT16_MIN) ? 0 : (int16_t)mx;
+
+    // 通道元数据一致性：timeWindowNs/soilVelocity 各通道应一致；不一致 warn（仍用 headers[0]）。
+    for (int i = 1; i < nc; ++i) {
+        if (headers[i].timeWindowNs != headers[0].timeWindowNs)
+            std::fprintf(stderr, "  [warn] 通道#%d timeWindowNs(%.4g) 与通道#0(%.4g) 不一致\n",
+                         i, headers[i].timeWindowNs, headers[0].timeWindowNs);
+        if (headers[i].soilVelocity != headers[0].soilVelocity)
+            std::fprintf(stderr, "  [warn] 通道#%d soilVelocity(%.3g) 与通道#0(%.3g) 不一致\n",
+                         i, headers[i].soilVelocity, headers[0].soilVelocity);
+    }
 
     // 元数据
     outMeta.channels = nc;

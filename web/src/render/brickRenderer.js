@@ -83,6 +83,13 @@ void main() {
   float tFar = tb.y;
   if (tFar <= tNear) { gl_FragColor = vec4(0.0); return; }
 
+  // 俯视图拼缝修复：片元落在盒的 X/Y 侧面（剪影）时，射线未到远 Z 面就侧面退出，
+  // 积分只覆盖楔形 → 比整列少 → 细暗线。把积分延伸到远 Z 面；t > 盒退出的采样点
+  // tc 越界被 ClampToEdge 钳到边缘体素，用边缘列数据补全整列积分，使剪影与内部一致。
+  // 限制：仅当缺失 Z 列较短时延伸（俯视/斜视剪影）；近水平侧视 tFarZ 巨大不延伸。
+  float tFarZ = rd.z >= 0.0 ? (1.0 - ro.z) / rd.z : (0.0 - ro.z) / rd.z;
+  if (tFarZ > tFar && tFarZ - tFar < 2.0) tFar = tFarZ;
+
   int steps = int(uSteps);
   float denom = float(max(steps - 1, 1));
   vec3 accC = vec3(0.0);   // 预乘颜色
@@ -110,10 +117,9 @@ void main() {
 }
 `;
 
-function stepsFor(coreSize) {
-  const m = Math.max(coreSize[0], coreSize[1], coreSize[2]);
-  return Math.max(64, Math.min(320, m));
-}
+// 默认光追步数：与 volumeScene.stepsFor() 的 16 保持一致。过高会在 12 线全载时把
+// Intel UHD 核显 GPU 粘滞卡死到 1Hz（见 volumeScene.stepsFor 注释），勿改回按尺寸自适应。
+const DEFAULT_STEPS = 16;
 
 // 创建瓦片 mesh。opts.linear 控制浮点纹理线性过滤；opts.geometry 共享单位立方体。
 // style 提供初始 uniform 值（每帧由 volumeScene.syncStyle 同步）。
@@ -124,7 +130,8 @@ export function createBrickMesh(tile, meta, style, opts = {}) {
   const storeSize = [header.width, header.height, header.depth];
 
   // 半精度上传：切片已解耦（读 CPU Float32），GPU 侧只有 3D 用，转换不影响切片质量。
-  const half = toHalfFloatArray(f32);
+  // 3D 路径已在 worker 内产出 half（tile.half）；主线程回退时这里再转一次。
+  const half = tile.half || toHalfFloatArray(f32);
   const texture = new THREE.Data3DTexture(half, storeSize[0], storeSize[1], storeSize[2]);
   texture.format = THREE.RedFormat;
   texture.type = THREE.HalfFloatType;
@@ -166,7 +173,7 @@ export function createBrickMesh(tile, meta, style, opts = {}) {
       uThresholdMin: { value: style.thresholdMin },
       uThresholdMax: { value: style.thresholdMax },
       uOpacity: { value: style.opacity },
-      uSteps: { value: opts.steps != null ? opts.steps : stepsFor(coreSize) },
+      uSteps: { value: opts.steps ?? DEFAULT_STEPS },
     },
     transparent: true,
     depthTest: false,
