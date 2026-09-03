@@ -59,6 +59,7 @@ set(SOURCES
   src/lod_generator.cpp
   src/tiler.cpp
   src/gvt_writer.cpp
+  src/chunk_writer.cpp
   src/metadata_writer.cpp
 )
 add_executable(gpr2gvt ${SOURCES})

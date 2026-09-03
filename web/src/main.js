@@ -13,6 +13,9 @@ import { createStylePanel } from './render/stylePanel.js';
 import { SliceView } from './render/sliceView.js';
 import { GpsMapView } from './render/gpsMapView.js';
 import { ViewCube } from './render/viewCube.js';
+import { createSceneGizmos, attachScaleBar } from './render/sceneGizmos.js';
+import { LayerManager } from './layers/layerManager.js';
+import { createLayerPanel } from './render/layerPanel.js';
 
 const statusEl = document.getElementById('status');
 const hudEl = document.getElementById('hud');
@@ -108,6 +111,10 @@ async function bootMulti(manifest) {
 
   const host = new MultiLineHost(viewportEl, lineCfgs);
   createStylePanel(document.getElementById('stylePanel'), style, metas[0]);
+  const lm = new LayerManager(); lm.attach(host);
+  createLayerPanel(document.getElementById('layerPanel'), lm);
+  lm.add({ id: 'gizmos', label: '场景参照（网格/指北针）', object3D: createSceneGizmos({ ref: metas[0].reference }).object3D, builtin: true });
+  attachScaleBar(viewportEl, host.camera);
 
   // B-Scan 数据源：测线下拉
   lineSelEl.innerHTML = '';

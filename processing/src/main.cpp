@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "chunk_writer.h"
 #include "gvt_common.h"
 #include "gvt_writer.h"
 #include "iprh_parser.h"
@@ -62,13 +63,14 @@ struct CliArgs {
     std::string line;
     std::string out = "dataset";
     std::string zeroMode = "max";
-    int tileW = 256, tileH = 32, tileD = 32;
+    int tileW = 256, tileH = 16, tileD = 128; // tileH 与 14 通道对齐；tileD 加大 → 深度方向瓦片 25→7
     int ghost = 1;
     int sx = 2, sy = 1, sz = 2;
     int levels = 4;
     std::string align = "max";
     int zstdLevel = 12;
     int jobs = 0;              // 0 = 自动（min(hardware_concurrency,8)）
+    int chunkSize = 16;        // 0 = 不打包 chunk（只写 .gvt）；>0 = 同 (level,z-slab) 连续 x 瓦片合并为 .gvtc
     std::string gps;           // 空 = 由 --line 基名派生 .utmgps
     int sliceLod = 2;          // 切片专用 mean-LOD 的降采样次数（相对 LOD0）；0 = 不生成
     std::string road = "mingxingroad"; // dataset id 前缀（原硬编码）
@@ -103,8 +105,9 @@ static void PrintHelp() {
         "         [--zero-mode max|channel] [--tile-size W,H,D] [--ghost N]\n"
         "         [--lod-scale X,Y,Z] [--levels N] [--zstd-level N] [--jobs N]\n"
         "         [--gps <.utmgps 路径>] [--slice-lod N]\n"
-        "         [--road <前缀>] [--utm-zone N] [--utm-north 0|1]\n\n"
+        "         [--chunk-size N] [--road <前缀>] [--utm-zone N] [--utm-north 0|1]\n\n"
         "  --slice-lod N  生成切片专用 mean-LOD（从 LOD0 箱平均 N 次，级别号=levels；0=不生成）\n"
+        "  --chunk-size N 同 (level,z-slab) 连续 x 瓦片打包为 .gvtc（默认 16；0=不打包）\n"
         "  --road S       dataset id 前缀（默认 mingxingroad）\n"
         "  --utm-zone N   GPS UTM 分带（默认 51）；--utm-north 0|1 南/北半球（默认 1=北）\n\n"
         "示例:\n"
@@ -168,6 +171,9 @@ static bool ParseArgs(const std::vector<std::string>& args, CliArgs& a) {
         } else if (key == "--slice-lod") {
             if (!needsVal()) return false;
             a.sliceLod = std::atoi(val.c_str());
+        } else if (key == "--chunk-size") {
+            if (!needsVal()) return false;
+            a.chunkSize = std::atoi(val.c_str());
         } else if (key == "--road") {
             if (!needsVal()) return false;
             a.road = val;
@@ -376,6 +382,7 @@ int main() {
     md.tileH = a.tileH;
     md.tileD = a.tileD;
     md.ghost = a.ghost;
+    md.chunkSize = a.chunkSize;
     md.valueScale = 1.0;
     md.valueOffset = 0.0;
     md.globalMin = gmin;
@@ -396,23 +403,41 @@ int main() {
     }
 
     // 6. LOD 分层分块写出（并行：构建瓦片 + 压缩 + 写盘）
-    // 通用「写一个 level 的全部瓦片」：并行 BuildTile → WriteGvtFile。
-    // 返回压缩字节数；失败返回 -1（outTiles 回传瓦片数）。
+    // 通用「写一个 level 的全部瓦片」：chunkSize>0 且 nty==1 时只写 .gvtc chunk（整包一条 zstd）；
+    // 否则逐瓦片 WriteGvtFile（单瓦片 .gvt）。返回压缩字节数；失败返回 -1（outTiles 回传瓦片数）。
     auto writeLevel = [&](const Volume& vol, int level, int64_t& outTiles) -> int64_t {
         const TileGrid grid = MakeTileGrid(vol, a.tileW, a.tileH, a.tileD, a.ghost);
         outTiles = grid.Count();
 
-        // 串行预创建全部瓦片父目录（消除写盘阶段目录并发竞态）
+        // chunk 布局 = 同一 (level, z-slab) 连续 x 瓦片；仅在单 y 瓦片（nty==1）时无歧义。
+        // 本数据集 tileH=16 ≥ 14 通道恒 nty==1；多 y 时退化为仅 .gvt。
+        const bool chunked = a.chunkSize > 0 && grid.nty == 1;
+        if (a.chunkSize > 0 && grid.nty != 1) {
+            std::fprintf(stderr, "[warn] L%d nty=%lld != 1，跳过 chunk 打包（仅写 .gvt）\n",
+                         level, (long long)grid.nty);
+        }
+
+        // 串行预创建全部父目录（消除写盘阶段目录并发竞态）
         {
             std::error_code ec;
-            for (int64_t tz = 0; tz < grid.ntz && !ec; ++tz)
-                for (int64_t ty = 0; ty < grid.nty && !ec; ++ty)
-                    for (int64_t tx = 0; tx < grid.ntx && !ec; ++tx) {
-                        const fs::path dir = fs::u8path(a.out) / "tiles" /
-                                             std::to_string(level) /
-                                             std::to_string(tx) / std::to_string(ty);
-                        fs::create_directories(dir, ec);
-                    }
+            if (chunked) {
+                // 只写 .gvtc：目录仅到 tiles/{level}/z{tz}/（不再建 per-tile {tx}/{ty}/）
+                for (int64_t tz = 0; tz < grid.ntz && !ec; ++tz) {
+                    const fs::path dir = fs::u8path(a.out) / "tiles" /
+                                         std::to_string(level) /
+                                         ("z" + std::to_string(tz));
+                    fs::create_directories(dir, ec);
+                }
+            } else {
+                for (int64_t tz = 0; tz < grid.ntz && !ec; ++tz)
+                    for (int64_t ty = 0; ty < grid.nty && !ec; ++ty)
+                        for (int64_t tx = 0; tx < grid.ntx && !ec; ++tx) {
+                            const fs::path dir = fs::u8path(a.out) / "tiles" /
+                                                 std::to_string(level) /
+                                                 std::to_string(tx) / std::to_string(ty);
+                            fs::create_directories(dir, ec);
+                        }
+            }
             if (ec) {
                 std::fprintf(stderr, "[error] 创建瓦片目录失败 L%d\n", level);
                 return -1;
@@ -420,19 +445,50 @@ int main() {
         }
 
         std::atomic<int64_t> levelBytes{0};
-        int failures = RunParallel(outTiles, nworkers, [&](int64_t i) -> bool {
-            int tx, ty, tz;
-            grid.Decode(i, tx, ty, tz);
-            TileDesc tile;
-            BuildTile(vol, level, tx, ty, tz, grid, tile);
-            const int64_t n = WriteGvtFile(a.out, tile, a.zstdLevel);
-            if (n < 0) return false;
-            levelBytes += n;
-            return true;
-        });
-        if (failures > 0) {
-            std::fprintf(stderr, "[error] 写瓦片失败 L%d（%d 块）\n", level, failures);
-            return -1;
+
+        if (chunked) {
+            // 并行粒度 = chunk：每 chunk 构建其瓦片一次，整包写 .gvtc（不再逐瓦片写 .gvt）。
+            // 内存峰值 = 一个 chunk 的瓦片（chunkSize × tileSize），不随 level 总量增长。
+            struct Chunk { int64_t tz, tx0, count; };
+            std::vector<Chunk> chunks;
+            for (int64_t tz = 0; tz < grid.ntz; ++tz)
+                for (int64_t tx0 = 0; tx0 < grid.ntx; tx0 += a.chunkSize) {
+                    chunks.push_back({ tz, tx0,
+                                       std::min((int64_t)a.chunkSize, grid.ntx - tx0) });
+                }
+
+            int failures = RunParallel((int64_t)chunks.size(), nworkers, [&](int64_t i) -> bool {
+                const Chunk& c = chunks[i];
+                std::vector<TileDesc> tiles(c.count);
+                for (int64_t k = 0; k < c.count; ++k) {
+                    const int tx = (int)(c.tx0 + k);
+                    BuildTile(vol, level, tx, /*ty=*/0, (int)c.tz, grid, tiles[k]);
+                }
+                const int64_t cs = WriteChunkFile(a.out, level, (int)c.tz, (int)c.tx0,
+                                                  tiles, a.zstdLevel);
+                if (cs < 0) return false;
+                levelBytes += cs;
+                return true;
+            });
+            if (failures > 0) {
+                std::fprintf(stderr, "[error] 写 chunk 失败 L%d（%d 个）\n", level, failures);
+                return -1;
+            }
+        } else {
+            int failures = RunParallel(outTiles, nworkers, [&](int64_t i) -> bool {
+                int tx, ty, tz;
+                grid.Decode(i, tx, ty, tz);
+                TileDesc tile;
+                BuildTile(vol, level, tx, ty, tz, grid, tile);
+                const int64_t n = WriteGvtFile(a.out, tile, a.zstdLevel);
+                if (n < 0) return false;
+                levelBytes += n;
+                return true;
+            });
+            if (failures > 0) {
+                std::fprintf(stderr, "[error] 写瓦片失败 L%d（%d 块）\n", level, failures);
+                return -1;
+            }
         }
         return levelBytes.load();
     };

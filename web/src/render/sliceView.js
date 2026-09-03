@@ -14,7 +14,7 @@
 // 注意纹理布局（brickRenderer）：Data3DTexture.image 长度 = storeW*storeH*storeD，x 最快：
 //   idx = (sz*storeH + sy)*storeW + sx；store = 核心 + ghost（各维 +2g）。提取用核心坐标。
 
-import { loadTile } from '../dataset/tileLoader.js';
+import { loadTileSmart } from '../dataset/tileLoader.js';
 
 const MAX_X = 2048;      // 沿轨显示分辨率上限（L0 X=45307，canvas 远小于此，显示足够）
 const MAX_Z = 1024;
@@ -37,11 +37,10 @@ function release() {
 }
 
 export class SliceView {
-  // 单线模式：{ meta, style, basePath, loadTileFn }
+  // 单线模式：{ meta, style, basePath }
   // 多线模式：lines = [{ id, name, meta, basePath, worldOffset, direction, visible }]
-  constructor({ meta, style, basePath = '/dataset', loadTileFn = loadTile, lines = null }) {
+  constructor({ meta, style, basePath = '/dataset', lines = null }) {
     this.style = style;
-    this.loadTileFn = loadTileFn;
 
     if (Array.isArray(lines) && lines.length) {
       this.multi = true;
@@ -256,11 +255,11 @@ export class SliceView {
       while (idx < keys.length) {
         if (gen !== line[genName]) return;
         const key = keys[idx++];
-        const [L, x, y, z] = key.split('/').map(Number);
         await acquire();
         try {
           if (gen !== line[genName]) return;
-          const tile = await this.loadTileFn(this.tileUrlFor(line, L, x, y, z), {
+          // chunk 感知：整包 .gvtc 优先，缺失/损坏回退单瓦片 .gvt（L 仅此处拆 key 用）。
+          const tile = await loadTileSmart(line.basePath, line.meta.storage, key, {
             ghost: line.meta.ghost, scale: 1, offset: 0,
           });
           if (gen !== line[genName]) return;

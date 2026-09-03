@@ -77,6 +77,12 @@ bool WriteMetadataFile(const std::string& outDirUtf8, const Metadata& meta) {
 
     j["storage"]["tilePath"] = "tiles/{level}/{x}/{y}/{z}.gvt";
     j["storage"]["compression"] = "zstd";
+    // chunk 容器（.gvtc）：同一 (level, z-slab) 的连续 x 瓦片打包为单文件单条 zstd。
+    // chunkSize=0 表示未打包，前端只走单瓦片 .gvt 路径。
+    j["storage"]["chunkPath"] = "tiles/{level}/z{tz}/x{x0}.gvtc";
+    j["storage"]["chunkSize"] = meta.chunkSize;
+    // chunkOnly：打包模式下不写 .gvt，前端 chunk 失败时直接报错（不回退 .gvt）。
+    if (meta.chunkSize > 0) j["storage"]["chunkOnly"] = true;
 
     if (!meta.gps.utmPoints.empty()) {
         j["gpsTrack"]["utm"]["zone"] = meta.gps.utmZone;

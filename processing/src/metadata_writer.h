@@ -30,6 +30,7 @@ struct Metadata {
     RegularizedMeta spatial;
     int tileW = 256, tileH = 32, tileD = 32;
     int ghost = 1;
+    int chunkSize = 0;             // >0 = 生成 .gvtc chunk 打包（同 (level,z-slab) 连续 x 瓦片）；0 = 仅 .gvt
     double valueScale  = 1.0;
     double valueOffset = 0.0;
     int16_t globalMin = 0, globalMax = 0;

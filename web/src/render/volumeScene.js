@@ -8,7 +8,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createBrickMesh } from './brickRenderer.js';
-import { loadTile } from '../dataset/tileLoader.js';
+import { loadTileSmart } from '../dataset/tileLoader.js';
 import { TileCache } from '../lod/tileCache.js';
 
 // 各级细分阈值：相机到瓦片中心 > 阈值 → 该级足够，渲染；更近 → 细分。
@@ -619,15 +619,16 @@ export class VolumeScene {
   }
 
   async loadTileAsync(key) {
-    const [level, x, y, z] = key.split('/').map(Number);
-    const url = this.tileUrl(level, x, y, z);
     const limiter = this.limiter;
     // 立即登记 inFlight（同步），再取全局信号量——否则 drainQueue 的 inFlight 计数
     // 会因 await acquire 而失真，让 while 循环把整个队列一次性全拉起来。
     const p = (async () => {
       try {
         if (limiter) await limiter.acquire();
-        const tile = await loadTile(url, { ghost: this.meta.ghost, scale: 1, offset: 0, half: true });
+        // chunk 感知：storage.chunkSize>0 时优先整包 .gvtc（一次请求取相邻瓦片），
+        // 缺失/损坏自动回退单瓦片 .gvt。
+        const tile = await loadTileSmart(this.basePath, this.meta.storage, key,
+          { ghost: this.meta.ghost, scale: 1, offset: 0, half: true });
         this.inFlight.delete(key);
         this.queued.delete(key);
         this.loaded.add(key);
