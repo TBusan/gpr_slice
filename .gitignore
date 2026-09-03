@@ -4,6 +4,9 @@ processing/build/
 # 管线输出（体积大，不入库）
 dataset/
 
+# 允许 web/src/dataset/ 源码入库（管线产物 dataset/ 仍被忽略）
+!web/src/dataset/
+
 # Node
 node_modules/
 web/dist/

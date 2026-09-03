@@ -1,0 +1,17 @@
+{
+  "default": "star_road",
+  "sources": [
+    {
+      "id": "star_road",
+      "name": "明星路 · 12 线",
+      "mode": "multi",
+      "manifestUrl": "/dataset/lines/manifest.json"
+    },
+    {
+      "id": "demo_single",
+      "name": "演示：单线",
+      "mode": "single",
+      "metadataUrl": "/dataset/metadata.json"
+    }
+  ]
+}

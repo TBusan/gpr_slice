@@ -6,6 +6,8 @@
 // 单线回退：manifest 缺失/加载失败 → 现有 /dataset/metadata.json 单线路径。
 
 import { loadMetadata, loadManifest } from './dataset/metadata.js';
+import { loadSources, getSourceFromUrl, switchSource } from './dataset/sources.js';
+import { saveLayerStore, loadLayerStore } from './io/layerStore.js';
 import { Style } from './render/style.js';
 import { VolumeScene } from './render/volumeScene.js';
 import { MultiLineHost } from './render/multiLineHost.js';
@@ -37,22 +39,51 @@ const LINE_COLORS = [
 const baseOf = (metaUrl) => metaUrl.replace(/\/metadata\.json$/, '');
 
 (async function boot() {
+  // T12 数据源：sources.json 决定 manifest/metadata 路径；?src= 覆盖
+  let sources = { default: 'demo', sources: [] };
+  try { sources = await loadSources(); } catch (e) { console.warn('no sources.json:', e.message); }
+  const requestedId = getSourceFromUrl() || sources.default;
+  const srcDef = sources.sources.find(s => s.id === requestedId) || sources.sources[0];
+  if (srcDef) setStatus(`数据源：${srcDef.name} (${srcDef.id})`);
+
+  const restore = srcDef ? loadLayerStore(srcDef.id) : null;
+  buildSourcePanel(sources, srcDef);
+
   let manifest = null;
-  try { manifest = await loadManifest(); }
-  catch (err) { console.warn('no manifest, single-line fallback:', err.message); }
+  if (srcDef && srcDef.mode === 'multi') {
+    try { manifest = await loadManifest(srcDef.manifestUrl); } catch (e) { console.warn('manifest load fail:', e.message); }
+  }
+  if (!manifest) {
+    try { manifest = await loadManifest(); } catch (e) { console.warn('no manifest:', e.message); }
+  }
   if (manifest && manifest.lines && manifest.lines.length) {
-    try { await bootMulti(manifest); }
+    try { await bootMulti(manifest, { srcDef, restore }); }
     catch (err) {
       console.error('multi boot failed, single-line fallback:', err);
-      await bootSingle();
+      await bootSingle({ srcDef, restore });
     }
   } else {
-    await bootSingle();
+    await bootSingle({ srcDef, restore });
   }
 })();
 
+function buildSourcePanel(sources, current) {
+  const el = document.getElementById('sourcePanel');
+  el.innerHTML = '<h3>数据源</h3>';
+  const row = document.createElement('div'); row.className = 'src-row';
+  const sel = document.createElement('select');
+  for (const s of sources.sources) {
+    const opt = document.createElement('option'); opt.value = s.id; opt.textContent = s.name;
+    if (current && s.id === current.id) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener('change', () => switchSource(sel.value));
+  row.appendChild(sel);
+  el.appendChild(row);
+}
+
 // ---- 单线回退路径（保持原有行为）----
-async function bootSingle() {
+async function bootSingle({ srcDef = null, restore = null } = {}) {
   let meta;
   try {
     meta = await loadMetadata('/dataset/metadata.json');
@@ -93,6 +124,8 @@ async function bootSingle() {
   setupArbitrarySection({ getHost: () => scene, style, lm, meta });
   setupMeasureTool({ getHost: () => scene });
   setStatus(`已加载 ${meta.dataset.name} · ${meta.volume.dimensions.join('×')} vox`);
+  if (srcDef) window.__srcId = srcDef.id;
+  attachPersist({ getSrcId: () => window.__srcId, camera: scene.camera, style, lm });
   window.__scene = scene;
   window.__slice = sliceView;
   window.__gps = gpsMapView;
@@ -101,7 +134,7 @@ async function bootSingle() {
 }
 
 // ---- 多线路径：manifest + 并行元数据 + MultiLineHost ----
-async function bootMulti(manifest) {
+async function bootMulti(manifest, { srcDef = null, restore = null } = {}) {
   const metas = await Promise.all(manifest.lines.map(l => loadMetadata(l.metaUrl)));
   let gmin = Infinity, gmax = -Infinity;
   for (const m of metas) {
@@ -190,6 +223,8 @@ async function bootMulti(manifest) {
   })();
 
   setStatus(`多测线 ${manifest.lines.length} 条 · ${metas[0].dataset.name}（GPS 定位）`);
+  if (srcDef) window.__srcId = srcDef.id;
+  attachPersist({ getSrcId: () => window.__srcId, camera: host.camera, style, lm });
   window.__scene = host;
   window.__slice = sliceView;
   window.__gps = gpsMapView;
@@ -338,6 +373,28 @@ function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
 }
 
 function flashStatus(text) { setStatus(text); }
+
+// ---- T12 持久化：builtin 可见性 / 相机 / 样式 写到 localStorage（按 srcId 隔离）----
+function attachPersist({ getSrcId, camera, style, lm }) {
+  // 恢复（从 localStorage 读）
+  const sid = getSrcId();
+  const saved = sid ? loadLayerStore(sid) : null;
+  if (saved) {
+    if (saved.camera) camera.position.set(saved.camera.x, saved.camera.y, saved.camera.z);
+    if (saved.style && saved.style.colorMapName) style.setColorMap(saved.style.colorMapName);
+  }
+  // 写：每 2s 一次
+  setInterval(() => {
+    if (!sid) return;
+    const builtinVisibility = {};
+    for (const l of lm.list()) if (l.builtin) builtinVisibility[l.id] = l.visible;
+    saveLayerStore(sid, {
+      builtinVisibility,
+      camera: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+      style: { colorMapName: style.colorMapName, opacity: style.opacity },
+    });
+  }, 2000);
+}
 
 // ---- T11 测量工具：2=测距 3=测面积（点击地面打点；Enter 完成；Esc 取消）----
 function setupMeasureTool({ getHost }) {
