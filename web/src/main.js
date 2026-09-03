@@ -246,6 +246,10 @@ function updateHud(s) {
 // ---- T7 钻孔 UI：拖入 CSV → 解析 → 3D 层组 + 面板 ----
 function setupBoreholeUI({ lm, meta, getHost }) {
   const dropEl = document.getElementById('dropHint');
+  let pendingSection = null;
+  let boreholeMap = null; // 解析后填
+  let worldPositions = null;
+
   const panel = createBoreholePanel(document.getElementById('boreholePanel'), {
     onToggle: (id, on) => {
       const bhLayer = lm.get('boreholes');
@@ -253,9 +257,20 @@ function setupBoreholeUI({ lm, meta, getHost }) {
       const grp = bhLayer.object3D.getObjectByName(`borehole:${id}`);
       if (grp) grp.visible = on;
     },
-    onSection: (id) => flashStatus(`剖面连线：${id}（T8 待实现）`),
+    onSection: (id) => {
+      if (!pendingSection) {
+        pendingSection = id;
+        flashStatus(`📌 剖面：起点 ${id} — 再点另一孔「剖面」连线`);
+      } else if (pendingSection === id) {
+        pendingSection = null;
+        flashStatus('已取消剖面选择');
+      } else {
+        addSectionLink({ lm, meta, worldPositions, idA: pendingSection, idB: id, boreholeMap });
+        flashStatus(`✓ 剖面：${pendingSection} ↔ ${id}`);
+        pendingSection = null;
+      }
+    },
   });
-  // 暴露给 drop
   window.__bhPanel = panel;
 
   // drag/drop
@@ -284,6 +299,26 @@ function setupBoreholeUI({ lm, meta, getHost }) {
 }
 
 function addBoreholeLayer({ lm, meta, parsed }) {
+  if (!meta.reference) { console.warn('无 manifest.reference，钻孔无法定位'); return; }
+  // 直接用 CSV 坐标当作 UTM（演示用；T12 数据源切换时再做相似变换）
+  worldPositions = {};
+  for (const b of parsed.boreholes) {
+    const [wx, wy] = siteToWorld(meta.reference, b.x, b.y);
+    worldPositions[b.id] = [wx, wy, b.ground != null ? b.ground : 0];
+  }
+  const object3D = buildBoreholeMeshes({ boreholes: parsed.boreholes, worldPositions, ref: meta.reference, radius: 0.3 });
+  lm.add({ id: 'boreholes', label: `钻孔（${parsed.boreholes.length}）`, object3D });
+  boreholeMap = new Map(parsed.boreholes.map(b => [b.id, b]));
+}
+
+import { buildSectionLinkMeshes } from './render/sectionLinkLayer.js';
+function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
+  if (!meta.reference || !worldPositions || !boreholeMap) return;
+  const a = boreholeMap.get(idA), b = boreholeMap.get(idB);
+  if (!a || !b) return;
+  const grp = buildSectionLinkMeshes({ a, b, worldPositions, ref: meta.reference });
+  lm.add({ id: `section:${idA}-${idB}`, label: `剖面 ${idA}↔${idB}`, object3D: grp });
+}
   if (!meta.reference) { console.warn('无 manifest.reference，钻孔无法定位'); return; }
   // 直接用 CSV 坐标当作 UTM（演示用；T12 数据源切换时再做相似变换）
   const worldPositions = {};
