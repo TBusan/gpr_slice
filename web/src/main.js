@@ -91,6 +91,7 @@ async function bootSingle() {
   linePanelEl.style.display = 'none';
 
   setupArbitrarySection({ getHost: () => scene, style, lm, meta });
+  setupMeasureTool({ getHost: () => scene });
   setStatus(`已加载 ${meta.dataset.name} · ${meta.volume.dimensions.join('×')} vox`);
   window.__scene = scene;
   window.__slice = sliceView;
@@ -177,6 +178,7 @@ async function bootMulti(manifest) {
   const viewCube = new ViewCube(document.getElementById('viewCube'), host);
 
   setupArbitrarySection({ getHost: () => host, style, lm, meta: metas[0] });
+  setupMeasureTool({ getHost: () => host });
   (function frame() {
     requestAnimationFrame(frame);
     try {
@@ -316,6 +318,7 @@ function addBoreholeLayer({ lm, meta, parsed }) {
 import { buildSectionLinkMeshes } from './render/sectionLinkLayer.js';
 import { resamplePolyline, renderSection } from './render/arbitrarySection.js';
 import { sampleWorld as worldSample } from './io/volumeSampler.js';
+import { polylineLength, polygonArea, formatLength, formatArea } from './render/measureTool.js';
 function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
   if (!meta.reference || !worldPositions || !boreholeMap) return;
   const a = boreholeMap.get(idA), b = boreholeMap.get(idB);
@@ -335,6 +338,48 @@ function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
 }
 
 function flashStatus(text) { setStatus(text); }
+
+// ---- T11 测量工具：2=测距 3=测面积（点击地面打点；Enter 完成；Esc 取消）----
+function setupMeasureTool({ getHost }) {
+  const hud = document.getElementById('measureHud');
+  let mode = null; let pts = [];
+  const ground = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+  const ray = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const viewportEl = document.getElementById('viewport');
+
+  const update = () => {
+    if (!mode) { hud.style.display = 'none'; return; }
+    hud.style.display = 'block';
+    let txt = `[${mode === 'len' ? '测距' : '测面积'}] 点数 ${pts.length}`;
+    if (mode === 'len' && pts.length >= 2) txt += ` · 累计 ${formatLength(polylineLength(pts))}`;
+    if (mode === 'area' && pts.length >= 3) txt += ` · 面积 ${formatArea(polygonArea(pts.map(p => [p[0], p[1]])))}`;
+    hud.textContent = txt + '  ·  Enter 完成  ·  Esc 取消';
+  };
+
+  const onKey = (e) => {
+    if (e.key === '2') { mode = 'len'; pts = []; update(); flashStatus('📏 测距模式（点击地面打点）'); }
+    else if (e.key === '3') { mode = 'area'; pts = []; update(); flashStatus('📐 测面积模式（≥3 点）'); }
+    else if (e.key === 'Enter') {
+      if (mode === 'len' && pts.length >= 2) { flashStatus(`✓ 测距 ${formatLength(polylineLength(pts))}`); }
+      else if (mode === 'area' && pts.length >= 3) { flashStatus(`✓ 面积 ${formatArea(polygonArea(pts.map(p => [p[0], p[1]])))}`); }
+      mode = null; pts = []; update();
+    }
+    else if (e.key === 'Escape') { mode = null; pts = []; update(); flashStatus('已取消测量'); }
+  };
+  window.addEventListener('keydown', onKey);
+
+  viewportEl.addEventListener('click', (e) => {
+    if (!mode) return;
+    const rect = viewportEl.getBoundingClientRect();
+    ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    ray.setFromCamera(ndc, getHost().camera);
+    const hit = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(ground, hit)) return;
+    pts.push([hit.x, hit.y, 0]); update();
+  });
+}
 
 // ---- T10 任意角度剖面：工具入口（点击地面打点 → Enter 结束 → 出图）----
 function setupArbitrarySection({ getHost, style, lm, meta }) {
