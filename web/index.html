@@ -58,6 +58,36 @@
     #status { position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
               color: #aaa; font-size: 12px; background: rgba(0,0,0,0.5); padding: 4px 12px;
               border-radius: 12px; pointer-events: none; }
+
+    /* === T5+ 专业面板骨架 === */
+    #sideBar  { position: absolute; top: 10px; left: 10px; width: 220px; max-height: calc(100vh - 20px);
+                display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+    .row { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+    .row .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; border: 1px solid #00000040; }
+    .row .label  { flex: 1; font-size: 11px; }
+    .row .del    { background: transparent; color: #e57373; border: 0; cursor: pointer; font-size: 14px; }
+    #layerPanel     { background: rgba(20,20,24,0.92); border:1px solid #333; border-radius:8px; padding: 8px 10px; }
+    #boreholePanel  { background: rgba(20,20,24,0.92); border:1px solid #333; border-radius:8px; padding: 8px 10px; max-height: 36vh; overflow-y: auto; }
+    #boreholePanel .bh-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; }
+    #boreholePanel .bh-row input[type=checkbox] { flex: none; }
+    #boreholePanel .bh-id { flex: none; color: #8ab4ff; }
+    #boreholePanel .bh-sec { margin-left: auto; background: #2a3a55; color: #cce; border: 0; border-radius: 3px; padding: 1px 6px; font-size: 10px; cursor: pointer; }
+    #sourcePanel { background: rgba(20,20,24,0.92); border:1px solid #333; border-radius:8px; padding: 8px 10px; }
+    #sourcePanel .src-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; }
+    #sourcePanel select { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 1px 4px; }
+    #sectionWindow { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                     width: 540px; max-height: 70vh; overflow-y: auto;
+                     background: rgba(15,17,22,0.95); border: 1px solid #4d9fff; border-radius: 10px;
+                     padding: 14px 16px; display: none; z-index: 50; }
+    #sectionWindow.open { display: block; }
+    #sectionWindow .x { float: right; cursor: pointer; color: #e57373; font-size: 16px; }
+    #dropHint { position: absolute; inset: 0; background: rgba(77,159,255,0.18);
+                border: 3px dashed #4d9fff; display: none; align-items: center; justify-content: center;
+                color: #fff; font-size: 18px; pointer-events: none; z-index: 100; }
+    #dropHint.on { display: flex; }
+    #measureHud { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+                  color: #fff; font-size: 12px; background: rgba(0,0,0,0.6);
+                  padding: 4px 12px; border-radius: 12px; pointer-events: none; display: none; }
   </style>
 </head>
 <body>
@@ -67,6 +97,11 @@
     </div>
     <div id="hud"></div>
     <div id="status">加载中…</div>
+    <div id="sideBar">
+      <div id="sourcePanel" class="panel"></div>
+      <div id="layerPanel"   class="panel"></div>
+      <div id="boreholePanel" class="panel"></div>
+    </div>
     <div id="stylePanel" class="panel"></div>
     <div id="linePanel" class="panel"><h3>测线可见性</h3><div id="lineList"></div></div>
     <div id="mapPanel" class="panel"><h3>UTM 轨迹</h3>
@@ -90,6 +125,9 @@
         <div class="slice"><div class="cap" id="cscanCap">C-Scan 深度 0</div><canvas id="cscanCanvas"></canvas></div>
       </div>
     </div>
+    <div id="sectionWindow"></div>
+    <div id="dropHint">拖入 CSV / DXF 文件到此处</div>
+    <div id="measureHud"></div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>
