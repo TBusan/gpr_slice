@@ -321,15 +321,32 @@ function setupBoreholeUI({ lm, meta, getHost }) {
     e.preventDefault(); dragDepth = 0; dropEl.classList.remove('on');
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
     if (!f) return;
-    if (!/\.csv$/i.test(f.name)) { flashStatus('✗ 仅支持 .csv 钻孔文件'); return; }
-    const text = await f.text();
-    let parsed;
-    try { parsed = parseBoreholeCsv(text); }
-    catch (err) { flashStatus('✗ CSV 解析失败：' + err.message); return; }
-    if (parsed.warnings.length) console.warn('CSV warnings:', parsed.warnings);
-    addBoreholeLayer({ lm, meta, parsed });
-    panel.setBoreholes(parsed.boreholes);
-    flashStatus(`✓ 钻孔 ${parsed.boreholes.length} 个（${parsed.warnings.length} 警告）`);
+    if (/\.csv$/i.test(f.name)) {
+      const text = await f.text();
+      let parsed;
+      try { parsed = parseBoreholeCsv(text); }
+      catch (err) { flashStatus('✗ CSV 解析失败：' + err.message); return; }
+      if (parsed.warnings.length) console.warn('CSV warnings:', parsed.warnings);
+      addBoreholeLayer({ lm, meta, parsed });
+      panel.setBoreholes(parsed.boreholes);
+      flashStatus(`✓ 钻孔 ${parsed.boreholes.length} 个（${parsed.warnings.length} 警告）`);
+      return;
+    }
+    if (/\.dxf$/i.test(f.name)) {
+      const text = await f.text();
+      let dxf;
+      try {
+        // 极简 DXF 解析：行扫描，识别 ENTITIES 段中 LINE 的 10/11/20/21/30/31 组码
+        dxf = parseDxfText(text);
+      } catch (err) { flashStatus('✗ DXF 解析失败：' + err.message); return; }
+      const lines = dxfToLines(dxf);
+      if (!lines.length) { flashStatus('✗ DXF 未发现可绘线段'); return; }
+      const object3D = buildDxfLayer({ lines, color: 0x4d9fff, center: true });
+      lm.add({ id: `dxf:${Date.now()}`, label: `DXF（${lines.length} 段）`, object3D });
+      flashStatus(`✓ DXF 导入：${lines.length} 段线`);
+      return;
+    }
+    flashStatus('✗ 不支持的文件类型（仅 .csv / .dxf）');
   };
   window.addEventListener('dragenter', onEnter);
   window.addEventListener('dragleave', onLeave);
@@ -354,6 +371,8 @@ import { buildSectionLinkMeshes } from './render/sectionLinkLayer.js';
 import { resamplePolyline, renderSection } from './render/arbitrarySection.js';
 import { sampleWorld as worldSample } from './io/volumeSampler.js';
 import { polylineLength, polygonArea, formatLength, formatArea } from './render/measureTool.js';
+import { dxfToLines } from './io/dxfLoader.js';
+import { buildDxfLayer } from './render/dxfLayer.js';
 function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
   if (!meta.reference || !worldPositions || !boreholeMap) return;
   const a = boreholeMap.get(idA), b = boreholeMap.get(idB);
@@ -517,6 +536,39 @@ function setupArbitrarySection({ getHost, style, lm, meta }) {
     flashStatus(`✓ 任意剖面：${poly.length} 点 · ${samples.length} 采样`);
     poly = [];
   }
+}
+
+// ---- T13 DXF 极简解析：行扫描 ENTITIES 段中的 LINE 10/11/20/21/30/31 组码 ----
+function parseDxfText(text) {
+  const lines = String(text).split(/\r?\n/);
+  let inEntities = false;
+  const entities = [];
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const code = lines[i].trim();
+    const val = (lines[i + 1] || '').trim();
+    i++;
+    if (code === '2' && val === 'ENTITIES') { inEntities = true; continue; }
+    if (code === '0' && val === 'ENDSEC' && inEntities) { inEntities = false; continue; }
+    if (!inEntities) continue;
+    if (code === '0') {
+      if (cur && cur.type === 'LINE' && cur.vertices) entities.push(cur);
+      cur = val === 'LINE' ? { type: 'LINE', vertices: [[0, 0, 0], [0, 0, 0]] } : null;
+      expect = null;
+      continue;
+    }
+    if (!cur) continue;
+    if (cur.type === 'LINE') {
+      if (code === '10') { cur.vertices[0][0] = Number(val) || 0; }
+      else if (code === '20') { cur.vertices[0][1] = Number(val) || 0; }
+      else if (code === '30') { cur.vertices[0][2] = Number(val) || 0; }
+      else if (code === '11') { cur.vertices[1][0] = Number(val) || 0; }
+      else if (code === '21') { cur.vertices[1][1] = Number(val) || 0; }
+      else if (code === '31') { cur.vertices[1][2] = Number(val) || 0; }
+    }
+  }
+  if (cur && cur.type === 'LINE' && cur.vertices) entities.push(cur);
+  return { entities };
 }
 
 // 清理（HMR 用）
