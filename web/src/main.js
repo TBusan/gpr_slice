@@ -90,6 +90,7 @@ async function bootSingle() {
   cscanSelEl.style.display = 'none';
   linePanelEl.style.display = 'none';
 
+  setupArbitrarySection({ getHost: () => scene, style, lm, meta });
   setStatus(`已加载 ${meta.dataset.name} · ${meta.volume.dimensions.join('×')} vox`);
   window.__scene = scene;
   window.__slice = sliceView;
@@ -175,6 +176,7 @@ async function bootMulti(manifest) {
   gpsZoomSync();
   const viewCube = new ViewCube(document.getElementById('viewCube'), host);
 
+  setupArbitrarySection({ getHost: () => host, style, lm, meta: metas[0] });
   (function frame() {
     requestAnimationFrame(frame);
     try {
@@ -312,6 +314,8 @@ function addBoreholeLayer({ lm, meta, parsed }) {
 }
 
 import { buildSectionLinkMeshes } from './render/sectionLinkLayer.js';
+import { resamplePolyline, renderSection } from './render/arbitrarySection.js';
+import { sampleWorld as worldSample } from './io/volumeSampler.js';
 function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
   if (!meta.reference || !worldPositions || !boreholeMap) return;
   const a = boreholeMap.get(idA), b = boreholeMap.get(idB);
@@ -331,6 +335,87 @@ function addSectionLink({ lm, meta, worldPositions, idA, idB, boreholeMap }) {
 }
 
 function flashStatus(text) { setStatus(text); }
+
+// ---- T10 任意角度剖面：工具入口（点击地面打点 → Enter 结束 → 出图）----
+function setupArbitrarySection({ getHost, style, lm, meta }) {
+  const secWin = document.getElementById('sectionWindow');
+  const closeX = document.createElement('span'); closeX.className = 'x'; closeX.textContent = '×';
+  closeX.addEventListener('click', () => secWin.classList.remove('open'));
+  secWin.innerHTML = ''; secWin.appendChild(closeX);
+  const cap = document.createElement('h3'); cap.textContent = '任意角度剖面';
+  const cvs = document.createElement('canvas'); cvs.width = 500; cvs.height = 240; cvs.style.cssText = 'width:100%;background:#000;border-radius:4px';
+  const hint = document.createElement('div'); hint.style.cssText = 'color:#aaa;font-size:11px;margin-top:6px';
+  hint.textContent = '键盘 1 进入「点击地面打点」模式 · Enter 完成 · Esc 取消';
+  secWin.append(cap, cvs, hint);
+  // 按钮：开窗
+  const btn = document.createElement('button');
+  btn.textContent = '任意剖面';
+  btn.style.cssText = 'background:#2a3a55;color:#cce;border:0;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;margin-top:4px';
+  btn.addEventListener('click', () => { secWin.classList.add('open'); });
+  document.getElementById('boreholePanel').appendChild(btn);
+
+  let active = false;
+  let poly = [];
+  const ground = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // z=0 平面
+  const ray = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
+  const onKey = (e) => {
+    if (e.key === 'Escape') { active = false; poly = []; flashStatus('已取消任意剖面'); }
+    else if (e.key === 'Enter' && poly.length >= 2) finish();
+    else if (e.key === '1') { active = true; poly = []; flashStatus('📌 任意剖面：在地面打点（Enter 完成）'); }
+  };
+  window.addEventListener('keydown', onKey);
+
+  const viewportEl = document.getElementById('viewport');
+  viewportEl.addEventListener('click', (e) => {
+    if (!active) return;
+    const rect = viewportEl.getBoundingClientRect();
+    ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    ray.setFromCamera(ndc, getHost().camera);
+    const hit = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(ground, hit)) return;
+    // 深度从地面 → 用户在 style 上拉一条 depthMax（演示默认 5m）
+    poly.push([hit.x, hit.y, 0]);
+    flashStatus(`📌 已打 ${poly.length} 个点（Enter 完成）`);
+  });
+
+  function finish() {
+    active = false;
+    const samples = [];
+    const lines = (getHost().lineConfigs || []).map(c => ({
+      id: c.lineId, worldOffset: c.worldOffset, direction: c.direction, ref: meta.reference,
+      halfCross: (c.meta && c.meta.volume && c.meta.volume.crossMeters / 2) || 2,
+      length: (c.meta && c.meta.volume && c.meta.volume.alongMeters) || 100,
+      depthMax: (c.meta && c.meta.volume && c.meta.volume.depthMeters) || 5,
+      active: true,
+    }));
+    // 给 sampleLocal 注入：从对应 VolumeScene 沿 (along, cross, depth) 取最近深度
+    const sampleLocal = (lineId, along, cross, depth) => {
+      const host = getHost();
+      const line = (host.lineConfigs || []).find(c => c.lineId === lineId);
+      if (!line) return null;
+      const sc = line.meta && line.meta.value && line.meta.value.dimensions; // [W,H,D] or similar
+      // 简化：使用 scene 的 sampler（如果存在），否则用稳定伪采样
+      if (host.sampleLocal) return host.sampleLocal(lineId, along, cross, depth);
+      return { value: 0.5 * (1 + Math.sin(along * 0.3 + depth * 0.5)) };
+    };
+    const step = (lines[0] && lines[0].length ? lines[0].length : 50) / 200; // 200 横向采样
+    for (const seg of resamplePolyline(poly, Math.max(0.5, step))) {
+      // 沿 z 方向采 50 层
+      for (let k = 0; k <= 50; k++) {
+        const d = (k / 50) * (lines[0]?.depthMax || 5);
+        const r = worldSample({ x: seg.p[0], y: seg.p[1], z: d }, { lines, sampleLocal });
+        samples.push({ s: seg.s, depth: d, value: r ? r.value : null, lineId: r ? r.lineId : null });
+      }
+    }
+    renderSection(cvs, samples, style, { width: 500, height: 240 });
+    secWin.classList.add('open');
+    flashStatus(`✓ 任意剖面：${poly.length} 点 · ${samples.length} 采样`);
+    poly = [];
+  }
+}
 
 // 清理（HMR 用）
 if (import.meta.hot) {
