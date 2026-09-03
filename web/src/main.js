@@ -16,6 +16,9 @@ import { ViewCube } from './render/viewCube.js';
 import { createSceneGizmos, attachScaleBar } from './render/sceneGizmos.js';
 import { LayerManager } from './layers/layerManager.js';
 import { createLayerPanel } from './render/layerPanel.js';
+import { createBoreholePanel } from './render/boreholePanel.js';
+import { parseBoreholeCsv } from './io/boreholeCsv.js';
+import { buildBoreholeMeshes, siteToWorld } from './render/boreholeLayer.js';
 
 const statusEl = document.getElementById('status');
 const hudEl = document.getElementById('hud');
@@ -64,6 +67,12 @@ async function bootSingle() {
   scene.style = style;
   scene.onStatus = (s) => updateHud(s);
   createStylePanel(document.getElementById('stylePanel'), style, meta);
+
+  const lm = new LayerManager(); lm.attach(scene);
+  createLayerPanel(document.getElementById('layerPanel'), lm);
+  lm.add({ id: 'gizmos', label: '场景参照（网格/指北针）', object3D: createSceneGizmos({ ref: meta.reference }).object3D, builtin: true });
+  attachScaleBar(viewportEl, scene.camera);
+  setupBoreholeUI({ lm, meta, getHost: () => scene });
 
   const sliceView = new SliceView({ meta, style, basePath: '/dataset' });
   const gpsMapView = new GpsMapView(document.getElementById('mapPanel'), scene, meta);
@@ -115,6 +124,7 @@ async function bootMulti(manifest) {
   createLayerPanel(document.getElementById('layerPanel'), lm);
   lm.add({ id: 'gizmos', label: '场景参照（网格/指北针）', object3D: createSceneGizmos({ ref: metas[0].reference }).object3D, builtin: true });
   attachScaleBar(viewportEl, host.camera);
+  setupBoreholeUI({ lm, meta: metas[0], getHost: () => host });
 
   // B-Scan 数据源：测线下拉
   lineSelEl.innerHTML = '';
@@ -232,6 +242,60 @@ function updateHud(s) {
     `LOD 目标 ${s.desired} · ${s.fps} fps` +
     (s.linear ? '' : ' · <span style="color:#ff8">浮点线性不可用，退化为最近邻</span>');
 }
+
+// ---- T7 钻孔 UI：拖入 CSV → 解析 → 3D 层组 + 面板 ----
+function setupBoreholeUI({ lm, meta, getHost }) {
+  const dropEl = document.getElementById('dropHint');
+  const panel = createBoreholePanel(document.getElementById('boreholePanel'), {
+    onToggle: (id, on) => {
+      const bhLayer = lm.get('boreholes');
+      if (!bhLayer) return;
+      const grp = bhLayer.object3D.getObjectByName(`borehole:${id}`);
+      if (grp) grp.visible = on;
+    },
+    onSection: (id) => flashStatus(`剖面连线：${id}（T8 待实现）`),
+  });
+  // 暴露给 drop
+  window.__bhPanel = panel;
+
+  // drag/drop
+  let dragDepth = 0;
+  const onEnter = (e) => { e.preventDefault(); dragDepth++; dropEl.classList.add('on'); };
+  const onLeave = (e) => { e.preventDefault(); dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) dropEl.classList.remove('on'); };
+  const onOver  = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
+  const onDrop  = async (e) => {
+    e.preventDefault(); dragDepth = 0; dropEl.classList.remove('on');
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    if (!/\.csv$/i.test(f.name)) { flashStatus('✗ 仅支持 .csv 钻孔文件'); return; }
+    const text = await f.text();
+    let parsed;
+    try { parsed = parseBoreholeCsv(text); }
+    catch (err) { flashStatus('✗ CSV 解析失败：' + err.message); return; }
+    if (parsed.warnings.length) console.warn('CSV warnings:', parsed.warnings);
+    addBoreholeLayer({ lm, meta, parsed });
+    panel.setBoreholes(parsed.boreholes);
+    flashStatus(`✓ 钻孔 ${parsed.boreholes.length} 个（${parsed.warnings.length} 警告）`);
+  };
+  window.addEventListener('dragenter', onEnter);
+  window.addEventListener('dragleave', onLeave);
+  window.addEventListener('dragover', onOver);
+  window.addEventListener('drop', onDrop);
+}
+
+function addBoreholeLayer({ lm, meta, parsed }) {
+  if (!meta.reference) { console.warn('无 manifest.reference，钻孔无法定位'); return; }
+  // 直接用 CSV 坐标当作 UTM（演示用；T12 数据源切换时再做相似变换）
+  const worldPositions = {};
+  for (const b of parsed.boreholes) {
+    const [wx, wy] = siteToWorld(meta.reference, b.x, b.y);
+    worldPositions[b.id] = [wx, wy, b.ground != null ? b.ground : 0];
+  }
+  const object3D = buildBoreholeMeshes({ boreholes: parsed.boreholes, worldPositions, ref: meta.reference, radius: 0.3 });
+  lm.add({ id: 'boreholes', label: `钻孔（${parsed.boreholes.length}）`, object3D });
+}
+
+function flashStatus(text) { setStatus(text); }
 
 // 清理（HMR 用）
 if (import.meta.hot) {
